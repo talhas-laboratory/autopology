@@ -37,10 +37,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Read package version
-        id: version
+      - name: Resolve image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
         run: |
-          echo "value=$(node -p 'require(\"./packages/cli/package.json\").version')" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          version="$(node -p 'require("./packages/cli/package.json").version')"
+          if [ -z "$version" ]; then
+            echo "Resolved package version is empty"
+            exit 1
+          fi
+          tag="$version"
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          fi
+          echo "value=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -48,5 +60,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/talhas-laboratory/autology:${{ github.event.inputs.tag || steps.version.outputs.value }}
+            ghcr.io/talhas-laboratory/autology:${{ steps.tag.outputs.value }}
             ghcr.io/talhas-laboratory/autology:latest

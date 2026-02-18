@@ -127,12 +127,16 @@ jobs:
             packaging/homebrew/autopology.rb
 
       - name: Update Homebrew tap
-        if: steps.changesets.outputs.published == 'true' && secrets.HOMEBREW_TAP_REPO != '' && secrets.HOMEBREW_TAP_TOKEN != ''
+        if: steps.changesets.outputs.published == 'true'
         env:
           VERSION: ${{ steps.version.outputs.value }}
           HOMEBREW_TAP_REPO: ${{ secrets.HOMEBREW_TAP_REPO }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          if [ -z "${HOMEBREW_TAP_REPO:-}" ] || [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "Homebrew tap update skipped: HOMEBREW_TAP_REPO or HOMEBREW_TAP_TOKEN is not set."
+            exit 0
+          fi
           git clone "https://${HOMEBREW_TAP_TOKEN}@github.com/${HOMEBREW_TAP_REPO}.git" tap
           mkdir -p tap/Formula
           cp packaging/homebrew/autopology.rb tap/Formula/autopology.rb

@@ -39,7 +39,8 @@ jobs:
 
       - name: Read package version
         id: version
-        run: echo "value=$(node -p \"require('./packages/cli/package.json').version\")" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "value=$(node -p 'require(\"./packages/cli/package.json\").version')" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6

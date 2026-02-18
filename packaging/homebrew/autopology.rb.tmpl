@@ -1,0 +1,29 @@
+class Autopology < Formula
+  desc "Local-first code graph and MCP tooling for large repositories"
+  homepage "https://github.com/talhas-laboratory/autology"
+  version "__VERSION__"
+  license "Apache-2.0"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/talhas-laboratory/autology/releases/download/v#{version}/autopology-macos-arm64.tar.gz"
+      sha256 "__MACOS_ARM64_SHA__"
+    else
+      url "https://github.com/talhas-laboratory/autology/releases/download/v#{version}/autopology-macos-x64.tar.gz"
+      sha256 "__MACOS_X64_SHA__"
+    end
+  end
+
+  on_linux do
+    url "https://github.com/talhas-laboratory/autology/releases/download/v#{version}/autopology-linux-x64.tar.gz"
+    sha256 "__LINUX_X64_SHA__"
+  end
+
+  def install
+    bin.install Dir["autopology*"].first => "autopology"
+  end
+
+  test do
+    assert_match "AuTopology", shell_output("#{bin}/autopology --help")
+  end
+end

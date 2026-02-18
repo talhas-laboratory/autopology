@@ -1,0 +1,144 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      NEO4J_URI: bolt://127.0.0.1:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: autopology_dev_pw
+      NEO4J_DATABASE: neo4j
+    services:
+      neo4j:
+        image: neo4j:5.26
+        env:
+          NEO4J_AUTH: neo4j/autopology_dev_pw
+        ports:
+          - 7474:7474
+          - 7687:7687
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for Neo4j
+        run: |
+          for i in {1..60}; do
+            if (echo > /dev/tcp/127.0.0.1/7687) >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Neo4j did not become ready in time"
+          exit 1
+
+      - name: Validate release candidates
+        run: |
+          npm run typecheck
+          npm test
+          npm run test:neo4j
+          npm run build
+          npm run release:pack:verify
+
+      - name: Create Release PR or publish to npm
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          version: npm run changeset:version
+          publish: npm run changeset:publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Read published CLI version
+        if: steps.changesets.outputs.published == 'true'
+        id: version
+        run: echo "value=$(node -p \"require('./packages/cli/package.json').version\")" >> "$GITHUB_OUTPUT"
+
+      - name: Build standalone bundles
+        if: steps.changesets.outputs.published == 'true'
+        run: npm run release:bundle:standalone
+
+      - name: Compute bundle checksums
+        if: steps.changesets.outputs.published == 'true'
+        id: bundle-sha
+        run: |
+          echo "macos_arm64=$(sha256sum dist/standalone/autopology-macos-arm64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "macos_x64=$(sha256sum dist/standalone/autopology-macos-x64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_x64=$(sha256sum dist/standalone/autopology-linux-x64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Render Homebrew formula
+        if: steps.changesets.outputs.published == 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.value }}" \
+          MACOS_ARM64_SHA="${{ steps.bundle-sha.outputs.macos_arm64 }}" \
+          MACOS_X64_SHA="${{ steps.bundle-sha.outputs.macos_x64 }}" \
+          LINUX_X64_SHA="${{ steps.bundle-sha.outputs.linux_x64 }}" \
+          bash scripts/release/render-homebrew-formula.sh
+
+      - name: Login to GHCR
+        if: steps.changesets.outputs.published == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        if: steps.changesets.outputs.published == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/talhas-laboratory/autology:${{ steps.version.outputs.value }}
+            ghcr.io/talhas-laboratory/autology:latest
+
+      - name: Publish GitHub Release assets
+        if: steps.changesets.outputs.published == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          files: |
+            dist/standalone/*.tar.gz
+            dist/standalone/SHA256SUMS.txt
+            packaging/homebrew/autopology.rb
+
+      - name: Update Homebrew tap
+        if: steps.changesets.outputs.published == 'true' && secrets.HOMEBREW_TAP_REPO != '' && secrets.HOMEBREW_TAP_TOKEN != ''
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          HOMEBREW_TAP_REPO: ${{ secrets.HOMEBREW_TAP_REPO }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://${HOMEBREW_TAP_TOKEN}@github.com/${HOMEBREW_TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp packaging/homebrew/autopology.rb tap/Formula/autopology.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/autopology.rb
+          git commit -m "autopology ${VERSION}" || exit 0
+          git push

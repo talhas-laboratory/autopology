@@ -1,0 +1,50 @@
+{
+  "name": "autopology-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/talhas-laboratory/autology.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "autopology": "node packages/cli/dist/index.js",
+    "test": "vitest run",
+    "test:neo4j": "vitest run tests-node/integration.neo4j.test.ts",
+    "test:watch": "vitest",
+    "lint": "eslint . --ext .ts",
+    "typecheck": "tsc -b",
+    "clean": "rm -rf dist .turbo node_modules",
+    "changeset:version": "changeset version",
+    "changeset:publish": "changeset publish",
+    "release:pack:verify": "bash scripts/release/verify-npm-pack.sh",
+    "release:bundle:standalone": "bash scripts/release/build-standalone.sh",
+    "release:docker:build": "docker build -t ghcr.io/talhas-laboratory/autology:${VERSION:-dev} ."
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.29.7",
+    "@types/node": "^22.13.10",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.7"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2",
+    "chokidar": "^4.0.3",
+    "commander": "^13.1.0",
+    "neo4j-driver": "^5.28.1",
+    "tree-sitter": "^0.22.4",
+    "tree-sitter-javascript": "^0.23.1",
+    "tree-sitter-python": "^0.23.6",
+    "tree-sitter-typescript": "^0.23.2",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.2"
+  }
+}

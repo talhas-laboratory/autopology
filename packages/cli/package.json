@@ -1,0 +1,41 @@
+{
+  "name": "autopology",
+  "version": "1.0.0",
+  "description": "AuTopology CLI for local-first code graph indexing and MCP serving",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/talhas-laboratory/autology.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "autopology": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@autopology/core": "1.0.0",
+    "@autopology/indexer": "1.0.0",
+    "@autopology/mcp-server": "1.0.0",
+    "@autopology/storage-neo4j": "1.0.0"
+  }
+}

@@ -1,0 +1,16 @@
+.autopology/
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+output/
+*.tsbuildinfo
+*.tgz
+*.egg-info/
+.DS_Store

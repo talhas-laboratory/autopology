@@ -253,11 +253,9 @@ export class GraphRepository {
   async getCounts(): Promise<{ files: number; nodes: number; edges: number }> {
     const session = openSession(this.ctx);
     try {
-      const [filesRes, nodesRes, edgesRes] = await Promise.all([
-        session.run('MATCH (f:File) RETURN count(f) AS n'),
-        session.run('MATCH (n:CodeNode) RETURN count(n) AS n'),
-        session.run('MATCH ()-[r]->() RETURN count(r) AS n'),
-      ]);
+      const filesRes = await session.run('MATCH (f:File) RETURN count(f) AS n');
+      const nodesRes = await session.run('MATCH (n:CodeNode) RETURN count(n) AS n');
+      const edgesRes = await session.run('MATCH ()-[r]->() RETURN count(r) AS n');
       return {
         files: Number(filesRes.records[0].get('n')),
         nodes: Number(nodesRes.records[0].get('n')),
@@ -271,45 +269,43 @@ export class GraphRepository {
   async understandCodebase(): Promise<Record<string, unknown>> {
     const session = openSession(this.ctx);
     try {
-      const [countsRes, modulesRes, conceptsRes, entryRes, langsRes] = await Promise.all([
-        session.run(
-          `MATCH (f:File)
-           WITH count(f) AS fileCount
-           MATCH (n:CodeNode)
-           WITH fileCount, count(n) AS nodeCount
-           MATCH ()-[r]->()
-           RETURN fileCount, nodeCount, count(r) AS edgeCount`,
-        ),
-        session.run(
-          `MATCH (m:Module)
-           RETURN m.name AS name
-           ORDER BY m.name ASC
-           LIMIT 20`,
-        ),
-        session.run(
-          `MATCH (c:Concept)
-           OPTIONAL MATCH (:CodeNode)-[:IMPLEMENTS]->(c)
-           RETURN c.name AS name, count(*) AS impls
-           ORDER BY impls DESC, name ASC
-           LIMIT 12`,
-        ),
-        session.run(
-          `MATCH (f:Function)
-           WHERE toLower(coalesce(f.name,'')) CONTAINS 'main'
-              OR toLower(coalesce(f.name,'')) CONTAINS 'handler'
-              OR toLower(coalesce(f.name,'')) CONTAINS 'controller'
-              OR toLower(coalesce(f.path,'')) CONTAINS '/api/'
-              OR toLower(coalesce(f.path,'')) CONTAINS '/routes/'
-           RETURN coalesce(f.path, f.id) AS entry
-           ORDER BY entry ASC
-           LIMIT 20`,
-        ),
-        session.run(
-          `MATCH (f:File)
-           WITH collect(DISTINCT toLower(coalesce(f.language,''))) AS langs
-           RETURN [l IN langs WHERE l <> '' | l] AS langs`,
-        ),
-      ]);
+      const countsRes = await session.run(
+        `MATCH (f:File)
+         WITH count(f) AS fileCount
+         MATCH (n:CodeNode)
+         WITH fileCount, count(n) AS nodeCount
+         MATCH ()-[r]->()
+         RETURN fileCount, nodeCount, count(r) AS edgeCount`,
+      );
+      const modulesRes = await session.run(
+        `MATCH (m:Module)
+         RETURN m.name AS name
+         ORDER BY m.name ASC
+         LIMIT 20`,
+      );
+      const conceptsRes = await session.run(
+        `MATCH (c:Concept)
+         OPTIONAL MATCH (:CodeNode)-[:IMPLEMENTS]->(c)
+         RETURN c.name AS name, count(*) AS impls
+         ORDER BY impls DESC, name ASC
+         LIMIT 12`,
+      );
+      const entryRes = await session.run(
+        `MATCH (f:Function)
+         WHERE toLower(coalesce(f.name,'')) CONTAINS 'main'
+            OR toLower(coalesce(f.name,'')) CONTAINS 'handler'
+            OR toLower(coalesce(f.name,'')) CONTAINS 'controller'
+            OR toLower(coalesce(f.path,'')) CONTAINS '/api/'
+            OR toLower(coalesce(f.path,'')) CONTAINS '/routes/'
+         RETURN coalesce(f.path, f.id) AS entry
+         ORDER BY entry ASC
+         LIMIT 20`,
+      );
+      const langsRes = await session.run(
+        `MATCH (f:File)
+         WITH collect(DISTINCT toLower(coalesce(f.language,''))) AS langs
+         RETURN [l IN langs WHERE l <> '' | l] AS langs`,
+      );
 
       const counts = countsRes.records[0];
       const modules = modulesRes.records.map((r) => String(r.get('name')));
@@ -434,43 +430,41 @@ export class GraphRepository {
       );
       if (!moduleRes.records.length) return null;
 
-      const [circularRes, orphanRes, couplingRes, moduleCouplingRes] = await Promise.all([
-        session.run(
-          `MATCH p = (m:Module {id: $id})-[:DEPENDS_ON*1..6]->(m)
-           WITH [n IN nodes(p) WHERE n:Module | n.name] AS cycle
-           RETURN cycle
-           LIMIT 10`,
-          { id: moduleNodeId },
-        ),
-        session.run(
-          `MATCH (m:Module)
-           WHERE NOT (m)-[:DEPENDS_ON]->(:Module)
-             AND NOT (:Module)-[:DEPENDS_ON]->(m)
-           RETURN m.name AS name
-           ORDER BY name ASC
-           LIMIT 25`,
-        ),
-        session.run(
-          `MATCH (m:Module)
-           OPTIONAL MATCH (m)-[:DEPENDS_ON]->(d:Module)
-           WITH m, count(DISTINCT d) AS outDegree
-           OPTIONAL MATCH (u:Module)-[:DEPENDS_ON]->(m)
-           WITH m, outDegree, count(DISTINCT u) AS inDegree
-           WITH m, inDegree, outDegree, (inDegree + outDegree) AS coupling
-           RETURN m.name AS module, inDegree, outDegree, coupling
-           ORDER BY coupling DESC, module ASC
-           LIMIT 12`,
-        ),
-        session.run(
-          `MATCH (m:Module {id: $id})
-           OPTIONAL MATCH (m)-[:DEPENDS_ON]->(d:Module)
-           WITH m, count(DISTINCT d) AS outDegree
-           OPTIONAL MATCH (u:Module)-[:DEPENDS_ON]->(m)
-           WITH count(DISTINCT u) AS inDegree, outDegree
-           RETURN (inDegree + outDegree) AS coupling`,
-          { id: moduleNodeId },
-        ),
-      ]);
+      const circularRes = await session.run(
+        `MATCH p = (m:Module {id: $id})-[:DEPENDS_ON*1..6]->(m)
+         WITH [n IN nodes(p) WHERE n:Module | n.name] AS cycle
+         RETURN cycle
+         LIMIT 10`,
+        { id: moduleNodeId },
+      );
+      const orphanRes = await session.run(
+        `MATCH (m:Module)
+         WHERE NOT (m)-[:DEPENDS_ON]->(:Module)
+           AND NOT (:Module)-[:DEPENDS_ON]->(m)
+         RETURN m.name AS name
+         ORDER BY name ASC
+         LIMIT 25`,
+      );
+      const couplingRes = await session.run(
+        `MATCH (m:Module)
+         OPTIONAL MATCH (m)-[:DEPENDS_ON]->(d:Module)
+         WITH m, count(DISTINCT d) AS outDegree
+         OPTIONAL MATCH (u:Module)-[:DEPENDS_ON]->(m)
+         WITH m, outDegree, count(DISTINCT u) AS inDegree
+         WITH m, inDegree, outDegree, (inDegree + outDegree) AS coupling
+         RETURN m.name AS module, inDegree, outDegree, coupling
+         ORDER BY coupling DESC, module ASC
+         LIMIT 12`,
+      );
+      const moduleCouplingRes = await session.run(
+        `MATCH (m:Module {id: $id})
+         OPTIONAL MATCH (m)-[:DEPENDS_ON]->(d:Module)
+         WITH m, count(DISTINCT d) AS outDegree
+         OPTIONAL MATCH (u:Module)-[:DEPENDS_ON]->(m)
+         WITH count(DISTINCT u) AS inDegree, outDegree
+         RETURN (inDegree + outDegree) AS coupling`,
+        { id: moduleNodeId },
+      );
 
       const row = moduleRes.records[0];
       const circularDependencies = circularRes.records
@@ -902,35 +896,33 @@ export class GraphRepository {
     if (functionName === '*') {
       const session = openSession(this.ctx);
       try {
-        const [hotspotsRes, failuresRes] = await Promise.all([
-          session.run(
-            `MATCH (w:RuntimeWindow)
-             WHERE w.bucket_start >= datetime($sinceIso)
-             OPTIONAL MATCH (callee:CodeNode {id: w.callee_id})
-             RETURN w.callee_id AS calleeId,
-                    coalesce(callee.name, callee.qualname, w.callee_id) AS calleeName,
-                    sum(w.samples) AS samples,
-                    sum(w.error_count) AS errors,
-                    sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration
-             ORDER BY samples DESC
-             LIMIT 25`,
-            { sinceIso },
-          ),
-          session.run(
-            `MATCH (w:RuntimeWindow)
-             WHERE w.bucket_start >= datetime($sinceIso)
-               AND coalesce(w.error_count, 0) > 0
-             RETURN toString(w.bucket_start) AS windowStart,
-                    w.caller_id AS callerId,
-                    w.callee_id AS calleeId,
-                    w.error_count AS errors,
-                    w.samples AS samples,
-                    w.avg_duration_ms AS avgDuration
-             ORDER BY w.bucket_start DESC, errors DESC
-             LIMIT 15`,
-            { sinceIso },
-          ),
-        ]);
+        const hotspotsRes = await session.run(
+          `MATCH (w:RuntimeWindow)
+           WHERE w.bucket_start >= datetime($sinceIso)
+           OPTIONAL MATCH (callee:CodeNode {id: w.callee_id})
+           RETURN w.callee_id AS calleeId,
+                  coalesce(callee.name, callee.qualname, w.callee_id) AS calleeName,
+                  sum(w.samples) AS samples,
+                  sum(w.error_count) AS errors,
+                  sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration
+           ORDER BY samples DESC
+           LIMIT 25`,
+          { sinceIso },
+        );
+        const failuresRes = await session.run(
+          `MATCH (w:RuntimeWindow)
+           WHERE w.bucket_start >= datetime($sinceIso)
+             AND coalesce(w.error_count, 0) > 0
+           RETURN toString(w.bucket_start) AS windowStart,
+                  w.caller_id AS callerId,
+                  w.callee_id AS calleeId,
+                  w.error_count AS errors,
+                  w.samples AS samples,
+                  w.avg_duration_ms AS avgDuration
+           ORDER BY w.bucket_start DESC, errors DESC
+           LIMIT 15`,
+          { sinceIso },
+        );
 
         const hotspots = hotspotsRes.records.map((row) => {
           const samples = Number(row.get('samples') || 0);
@@ -992,57 +984,55 @@ export class GraphRepository {
     const targetId = targetIds[0];
     const session = openSession(this.ctx);
     try {
-      const [incomingRes, byCallerRes, outgoingRes, failuresRes] = await Promise.all([
-        session.run(
-          `MATCH (w:RuntimeWindow {callee_id: $targetId})
-           WHERE w.bucket_start >= datetime($sinceIso)
-           RETURN sum(w.samples) AS samples,
-                  sum(w.error_count) AS errors,
-                  sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration,
-                  max(w.last_seen) AS lastSeen`,
-          { targetId, sinceIso },
-        ),
-        session.run(
-          `MATCH (w:RuntimeWindow {callee_id: $targetId})
-           WHERE w.bucket_start >= datetime($sinceIso)
-           OPTIONAL MATCH (caller:CodeNode {id: w.caller_id})
-           RETURN w.caller_id AS callerId,
-                  coalesce(caller.name, caller.qualname, w.caller_id) AS callerName,
-                  sum(w.samples) AS samples,
-                  sum(w.error_count) AS errors,
-                  sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration,
-                  max(w.last_seen) AS lastSeen
-           ORDER BY samples DESC
-           LIMIT 12`,
-          { targetId, sinceIso },
-        ),
-        session.run(
-          `MATCH (w:RuntimeWindow {caller_id: $targetId})
-           WHERE w.bucket_start >= datetime($sinceIso)
-           OPTIONAL MATCH (callee:CodeNode {id: w.callee_id})
-           RETURN w.callee_id AS calleeId,
-                  coalesce(callee.name, callee.qualname, w.callee_id) AS calleeName,
-                  sum(w.samples) AS samples,
-                  sum(w.error_count) AS errors,
-                  sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration
-           ORDER BY samples DESC
-           LIMIT 12`,
-          { targetId, sinceIso },
-        ),
-        session.run(
-          `MATCH (w:RuntimeWindow {callee_id: $targetId})
-           WHERE w.bucket_start >= datetime($sinceIso)
-             AND coalesce(w.error_count, 0) > 0
-           RETURN toString(w.bucket_start) AS windowStart,
-                  w.caller_id AS callerId,
-                  w.error_count AS errors,
-                  w.samples AS samples,
-                  w.avg_duration_ms AS avgDuration
-           ORDER BY w.bucket_start DESC, errors DESC
-           LIMIT 10`,
-          { targetId, sinceIso },
-        ),
-      ]);
+      const incomingRes = await session.run(
+        `MATCH (w:RuntimeWindow {callee_id: $targetId})
+         WHERE w.bucket_start >= datetime($sinceIso)
+         RETURN sum(w.samples) AS samples,
+                sum(w.error_count) AS errors,
+                sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration,
+                max(w.last_seen) AS lastSeen`,
+        { targetId, sinceIso },
+      );
+      const byCallerRes = await session.run(
+        `MATCH (w:RuntimeWindow {callee_id: $targetId})
+         WHERE w.bucket_start >= datetime($sinceIso)
+         OPTIONAL MATCH (caller:CodeNode {id: w.caller_id})
+         RETURN w.caller_id AS callerId,
+                coalesce(caller.name, caller.qualname, w.caller_id) AS callerName,
+                sum(w.samples) AS samples,
+                sum(w.error_count) AS errors,
+                sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration,
+                max(w.last_seen) AS lastSeen
+         ORDER BY samples DESC
+         LIMIT 12`,
+        { targetId, sinceIso },
+      );
+      const outgoingRes = await session.run(
+        `MATCH (w:RuntimeWindow {caller_id: $targetId})
+         WHERE w.bucket_start >= datetime($sinceIso)
+         OPTIONAL MATCH (callee:CodeNode {id: w.callee_id})
+         RETURN w.callee_id AS calleeId,
+                coalesce(callee.name, callee.qualname, w.callee_id) AS calleeName,
+                sum(w.samples) AS samples,
+                sum(w.error_count) AS errors,
+                sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration
+         ORDER BY samples DESC
+         LIMIT 12`,
+        { targetId, sinceIso },
+      );
+      const failuresRes = await session.run(
+        `MATCH (w:RuntimeWindow {callee_id: $targetId})
+         WHERE w.bucket_start >= datetime($sinceIso)
+           AND coalesce(w.error_count, 0) > 0
+         RETURN toString(w.bucket_start) AS windowStart,
+                w.caller_id AS callerId,
+                w.error_count AS errors,
+                w.samples AS samples,
+                w.avg_duration_ms AS avgDuration
+         ORDER BY w.bucket_start DESC, errors DESC
+         LIMIT 10`,
+        { targetId, sinceIso },
+      );
 
       const incoming = incomingRes.records[0];
       const incomingSamples = Number(incoming?.get('samples') || 0);

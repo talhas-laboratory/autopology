@@ -20,6 +20,7 @@
     "test": "vitest run",
     "test:effectiveness": "vitest run tests-node/mcp-effectiveness-gate.test.ts",
     "test:neo4j": "vitest run tests-node/integration.neo4j.test.ts",
+    "test:neo4j:scope": "vitest run tests-node/repo-scope-isolation.neo4j.test.ts",
     "test:watch": "vitest",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc -b",
@@ -27,6 +28,7 @@
     "changeset:version": "changeset version",
     "changeset:publish": "changeset publish",
     "release:pack:verify": "bash scripts/release/verify-npm-pack.sh",
+    "verify:server:smoke": "bash scripts/release/verify-server-smoke.sh",
     "release:bundle:standalone": "bash scripts/release/build-standalone.sh",
     "release:docker:build": "docker build -t ghcr.io/talhas-laboratory/autology:${VERSION:-dev} ."
   },

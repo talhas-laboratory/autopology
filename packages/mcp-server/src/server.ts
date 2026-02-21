@@ -1,7 +1,7 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod/v4';
-import { loadConfig } from '@autopology/core';
+import { deriveRepoScope, loadConfig } from '@autopology/core';
 import { createNeo4jContext, GraphRepository, initSchema } from '@autopology/storage-neo4j';
 import { ToolService } from './service.js';
 
@@ -19,10 +19,11 @@ function toolResult(payload: unknown) {
 
 export async function createMcpApp(repoRoot: string) {
   const cfg = loadConfig(repoRoot);
+  const scope = deriveRepoScope(repoRoot);
   const neo4j = createNeo4jContext(cfg.neo4j);
-  await initSchema(neo4j, repoRoot);
+  await initSchema(neo4j, scope);
 
-  const repo = new GraphRepository(neo4j);
+  const repo = new GraphRepository(neo4j, scope);
   const tools = new ToolService(repo, cfg, repoRoot);
   void tools.warmUp().catch(() => {
     // Warm-up is best-effort and must never block server startup.

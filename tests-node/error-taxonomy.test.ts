@@ -105,4 +105,31 @@ describe('error taxonomy', () => {
     expect(out.error?.code).toBe('STALE_DATA');
     expect(out.error?.recoverable).toBe(true);
   });
+
+  it('maps repo scope failures to recoverable scope errors', async () => {
+    const repo = {
+      ctx: {} as never,
+      scope: { repoKey: 'scope:test' },
+      getFreshness: async () => ({ graphVersion: '1', indexedAt: '2026-02-18T00:00:00Z' }),
+      ensureScopeReady: async () => {
+        const err = new Error('No indexed graph is available') as Error & { code?: string; suggestion?: string };
+        err.code = 'REPO_SCOPE_UNINDEXED';
+        err.suggestion = 'Run autopology graph create --repo /repo --full';
+        throw err;
+      },
+      findTarget: async () => [{ id: 'sym:typescript:src/a.ts:Function:run:1' }],
+    } as any;
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'autopology-error-taxonomy-'));
+    dirs.push(tmp);
+    const svc = new ToolService(
+      repo,
+      config(),
+      tmp,
+      new CacheManager(tmp, new WarmMock(), { hotTtlMs: 10_000, warmTtlMs: 10_000, coldTtlMs: 10_000 }),
+    );
+    const out = await svc.findTarget('run');
+    expect(out.error?.code).toBe('REPO_SCOPE_UNINDEXED');
+    expect(out.error?.recoverable).toBe(true);
+  });
 });

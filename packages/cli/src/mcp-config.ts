@@ -7,8 +7,8 @@ interface StdIoServerConfig {
   args: string[];
 }
 
-function serverConfig(client: McpClient, repoRoot: string): StdIoServerConfig {
-  if (client === 'vscode' || client === 'cursor' || client === 'windsurf') {
+function serverConfig(client: McpClient, repoRoot: string, pinRepo = false): StdIoServerConfig {
+  if ((client === 'vscode' || client === 'cursor' || client === 'windsurf') && !pinRepo) {
     return {
       command: 'autopology',
       args: ['mcp'],
@@ -29,8 +29,8 @@ export function parseMcpClient(input: string): McpClient {
   throw new Error(`unsupported MCP client "${input}". expected one of: ${MCP_CLIENTS.join(', ')}`);
 }
 
-export function buildMcpConfigObject(client: McpClient, repoRoot: string): Record<string, unknown> {
-  const stdio = serverConfig(client, repoRoot);
+export function buildMcpConfigObject(client: McpClient, repoRoot: string, pinRepo = false): Record<string, unknown> {
+  const stdio = serverConfig(client, repoRoot, pinRepo);
   if (client === 'vscode') {
     return {
       mcp: {
@@ -48,7 +48,7 @@ export function buildMcpConfigObject(client: McpClient, repoRoot: string): Recor
   };
 }
 
-export function buildMcpConfigSnippet(client: McpClient, repoRoot: string): string {
-  const payload = buildMcpConfigObject(client, repoRoot);
+export function buildMcpConfigSnippet(client: McpClient, repoRoot: string, pinRepo = false): string {
+  const payload = buildMcpConfigObject(client, repoRoot, pinRepo);
   return JSON.stringify(payload, null, 2);
 }

@@ -32,6 +32,12 @@ npx autopology@1.0.0 setup --repo /path/to/repo
 npx autopology@1.0.0 mcp configure --client claude --repo /path/to/repo
 ```
 
+If your editor launches MCP from an unexpected cwd, pin the repo explicitly:
+
+```bash
+npx autopology@1.0.0 mcp configure --client cursor --repo /path/to/repo --pin-repo
+```
+
 4. Run MCP server:
 
 ```bash
@@ -48,10 +54,24 @@ See `/Users/talhauddin/software/AuTopology/docs/install/README.md` for channel-s
 autopology setup --repo /path/to/repo --full
 autopology doctor --repo /path/to/repo
 autopology graph create --repo /path/to/repo --incremental
+autopology graph prune --repo /path/to/repo
 autopology watch --repo /path/to/repo
 autopology mcp --repo /path/to/repo
 autopology mcp configure --client cursor --repo /path/to/repo
 autopology viz --repo /path/to/repo --node module:src --depth 2 --format mermaid
+```
+
+## Repo-Scoped Isolation
+
+AuTopology stores graph data for multiple repos in a single Neo4j database using deterministic repo scopes.
+Each MCP server instance reads/writes only the active repo scope.
+
+- Scope key is derived from the canonical repo root path.
+- Scoped graph data is fail-closed for MCP tools: if the active repo has not been indexed, tool calls return actionable guidance.
+- Recommended remediation:
+
+```bash
+autopology graph create --repo /path/to/repo --full
 ```
 
 Runtime ingest hook:
@@ -72,7 +92,14 @@ npm ci
 npm run typecheck
 npm run test
 npm run test:effectiveness
+npm run test:neo4j:scope
 npm run build
+```
+
+Server smoke verification against a target repo:
+
+```bash
+npm run verify:server:smoke -- /absolute/path/to/repo
 ```
 
 ## Release Channels

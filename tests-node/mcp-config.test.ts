@@ -39,6 +39,18 @@ describe('mcp config templates', () => {
     });
   });
 
+  it('pins repo path in client config when requested', () => {
+    const config = buildMcpConfigObject('cursor', '/repo', true);
+    expect(config).toEqual({
+      mcpServers: {
+        autopology: {
+          command: 'autopology',
+          args: ['mcp', '--repo', '/repo'],
+        },
+      },
+    });
+  });
+
   it('renders pretty JSON', () => {
     const snippet = buildMcpConfigSnippet('cursor', '/repo');
     expect(snippet).toContain('"mcpServers"');

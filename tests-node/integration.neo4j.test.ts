@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { loadConfig, writeDefaultConfig } from '../packages/core/src/index.ts';
+import { deriveRepoScope, loadConfig, writeDefaultConfig } from '../packages/core/src/index.ts';
 import { indexRepo } from '../packages/indexer/src/index.ts';
 import {
   closeNeo4j,
@@ -55,12 +55,13 @@ withNeo4j('neo4j integration', () => {
 
     writeDefaultConfig(repoRoot);
     const cfg = loadConfig(repoRoot);
+    const scope = deriveRepoScope(repoRoot);
     const ctx = createNeo4jContext(cfg.neo4j);
 
     try {
       await verifyConnection(ctx);
-      await initSchema(ctx, repoRoot);
-      const graph = new GraphRepository(ctx);
+      await initSchema(ctx, scope);
+      const graph = new GraphRepository(ctx, scope);
       await graph.clearGraph();
 
       const result = await indexRepo(graph, repoRoot, 'full', cfg);
@@ -116,12 +117,13 @@ withNeo4j('neo4j integration', () => {
 
     writeDefaultConfig(repoRoot);
     const cfg = loadConfig(repoRoot);
+    const scope = deriveRepoScope(repoRoot);
     const ctx = createNeo4jContext(cfg.neo4j);
 
     try {
       await verifyConnection(ctx);
-      await initSchema(ctx, repoRoot);
-      const graph = new GraphRepository(ctx);
+      await initSchema(ctx, scope);
+      const graph = new GraphRepository(ctx, scope);
       await graph.clearGraph();
 
       const t0 = Date.now();
@@ -155,10 +157,13 @@ withNeo4j('neo4j integration', () => {
       const session = ctx.driver.session({ database: cfg.neo4j.database });
       const schemaRes = await session.run(
         `MATCH (n:CodeNode)
+         WHERE n.id STARTS WITH $scopePrefix
          WITH collect(DISTINCT labels(n)) AS lbls
-         MATCH ()-[r]->()
+         MATCH (s:CodeNode)-[r]->(d:CodeNode)
+         WHERE s.id STARTS WITH $scopePrefix AND d.id STARTS WITH $scopePrefix
          WITH lbls, collect(DISTINCT type(r)) AS rels
          RETURN lbls AS labels, rels AS rels`,
+        { scopePrefix: scope.scopePrefix },
       );
       await session.close();
       const labels = schemaRes.records[0].get('labels') as string[][];
@@ -182,12 +187,13 @@ withNeo4j('neo4j integration', () => {
 
     writeDefaultConfig(tmp);
     const cfg = loadConfig(tmp);
+    const scope = deriveRepoScope(tmp);
     const ctx = createNeo4jContext(cfg.neo4j);
 
     try {
       await verifyConnection(ctx);
-      await initSchema(ctx, tmp);
-      const warm = new Neo4jWarmCache(ctx);
+      await initSchema(ctx, scope);
+      const warm = new Neo4jWarmCache(ctx, scope.repoKey);
 
       const key = 'trace_impact:abc';
       const freshness = '1:demo';
@@ -225,17 +231,18 @@ withNeo4j('neo4j integration', () => {
 
     writeDefaultConfig(repoRoot);
     const cfg = loadConfig(repoRoot);
+    const scope = deriveRepoScope(repoRoot);
     const ctx = createNeo4jContext(cfg.neo4j);
     try {
       await verifyConnection(ctx);
-      await initSchema(ctx, repoRoot);
-      const graph = new GraphRepository(ctx);
+      await initSchema(ctx, scope);
+      const graph = new GraphRepository(ctx, scope);
       await graph.clearGraph();
       await indexRepo(graph, repoRoot, 'full', cfg);
 
       const caller = 'sym:typescript:src/a.ts:Function:run:1';
       const callee = 'sym:typescript:src/a.ts:Function:sink:5';
-      const runtime = new RuntimeHookService(ctx);
+      const runtime = new RuntimeHookService(ctx, scope);
       await runtime.ingestSpan({
         callerId: caller,
         calleeId: callee,
@@ -256,13 +263,22 @@ withNeo4j('neo4j integration', () => {
 
       const session = ctx.driver.session({ database: cfg.neo4j.database });
       const agg = await session.run(
-        `MATCH (n:RuntimeSpanAggregate) RETURN count(n) AS n`,
+        `MATCH (n:RuntimeSpanAggregate)
+         WHERE n.id STARTS WITH $scopePrefix
+         RETURN count(n) AS n`,
+        { scopePrefix: scope.scopePrefix },
       );
       const windows = await session.run(
-        `MATCH (n:RuntimeWindow) RETURN count(n) AS n`,
+        `MATCH (n:RuntimeWindow)
+         WHERE n.id STARTS WITH $scopePrefix
+         RETURN count(n) AS n`,
+        { scopePrefix: scope.scopePrefix },
       );
       const observed = await session.run(
-        `MATCH ()-[r:OBSERVED_CALL]->() RETURN count(r) AS n`,
+        `MATCH (s:CodeNode)-[r:OBSERVED_CALL]->(d:CodeNode)
+         WHERE s.id STARTS WITH $scopePrefix AND d.id STARTS WITH $scopePrefix
+         RETURN count(r) AS n`,
+        { scopePrefix: scope.scopePrefix },
       );
       await session.close();
       expect(Number(agg.records[0].get('n') || 0)).toBeGreaterThan(0);

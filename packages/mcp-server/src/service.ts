@@ -31,6 +31,7 @@ export class ToolService {
   readonly cache: CacheManager;
   readonly logger: ToolLogger;
   readonly metrics: ToolMetrics;
+  private readonly repoScopeKey: string;
   private activeSessions = 0;
   private totalExecutions = 0;
   private truncatedExecutions = 0;
@@ -47,11 +48,12 @@ export class ToolService {
     this.logger = observability?.logger || new StructuredStderrLogger();
     this.metrics = observability?.metrics || new InMemoryMetrics();
 
+    this.repoScopeKey = this.repo.scope?.repoKey || 'scope:test';
     if (cache) {
       this.cache = cache;
       return;
     }
-    const warm = new Neo4jWarmCache(repo.ctx);
+    const warm = new Neo4jWarmCache(repo.ctx, this.repoScopeKey);
     this.cache = new CacheManager(repoRoot, warm, cfg.cache);
   }
 
@@ -944,10 +946,14 @@ export class ToolService {
       tool,
       input: sanitizeLogInput(input) as Record<string, unknown>,
       timestamp: new Date(startedAt).toISOString(),
+      repo_scope: this.repoScopeKey,
       request_id: requestId,
     });
 
     try {
+      if (typeof (this.repo as { ensureScopeReady?: () => Promise<void> }).ensureScopeReady === 'function') {
+        await this.repo.ensureScopeReady();
+      }
       const output = await execute();
       const duration = Date.now() - startedAt;
       const tokensUsed = Number(output.metadata.estimated_tokens || 0);
@@ -1055,7 +1061,7 @@ export class ToolService {
     producer: (freshness: FreshnessMeta) => Promise<ProgressiveOutput>,
   ): Promise<ProgressiveOutput> {
     const freshnessMeta = await this.getFreshnessCached();
-    const freshnessStamp = `${freshnessMeta.graphVersion}:${freshnessMeta.indexedAt || 'none'}:${freshnessMeta.commitHash || 'none'}:${freshnessMeta.runtimeUpdatedAt || 'none'}`;
+    const freshnessStamp = `${this.repoScopeKey}:${freshnessMeta.graphVersion}:${freshnessMeta.indexedAt || 'none'}:${freshnessMeta.commitHash || 'none'}:${freshnessMeta.runtimeUpdatedAt || 'none'}`;
 
     const found = await this.cache.get<ProgressiveOutput>(key, freshnessStamp);
     if (found.value) {
@@ -1086,7 +1092,7 @@ export class ToolService {
   }
 
   private key(tool: string, args: Record<string, unknown>): string {
-    return `${tool}:${crypto.createHash('sha256').update(JSON.stringify(args)).digest('hex')}`;
+    return `${this.repoScopeKey}:${tool}:${crypto.createHash('sha256').update(JSON.stringify(args)).digest('hex')}`;
   }
 
   private async getFreshnessCached(force = false): Promise<RepositoryFreshness> {
@@ -1176,7 +1182,14 @@ function notFoundOutput(message: string, budget: ContextBudgetManager, freshness
 }
 
 function classifyToolError(error: unknown): {
-  code: 'PARSE_ERROR' | 'QUERY_TIMEOUT' | 'STALE_DATA' | 'UNHANDLED_EXCEPTION';
+  code:
+    | 'PARSE_ERROR'
+    | 'QUERY_TIMEOUT'
+    | 'STALE_DATA'
+    | 'REPO_SCOPE_INVALID'
+    | 'REPO_SCOPE_MISMATCH'
+    | 'REPO_SCOPE_UNINDEXED'
+    | 'UNHANDLED_EXCEPTION';
   message: string;
   recoverable: boolean;
   suggestion?: string;
@@ -1184,6 +1197,9 @@ function classifyToolError(error: unknown): {
   const rawMessage = error instanceof Error ? error.message : String(error);
   const msg = rawMessage.toLowerCase();
   const maybeCode = typeof error === 'object' && error && 'code' in error ? String((error as Record<string, unknown>).code) : '';
+  const maybeSuggestion = typeof error === 'object' && error && 'suggestion' in error
+    ? String((error as Record<string, unknown>).suggestion || '')
+    : '';
 
   if (maybeCode === 'PARSE_ERROR' || msg.includes('parse') || msg.includes('tree-sitter')) {
     return {
@@ -1209,6 +1225,18 @@ function classifyToolError(error: unknown): {
       suggestion: 'Reindex or ingest fresh runtime spans before retrying.',
     };
   }
+  if (
+    maybeCode === 'REPO_SCOPE_INVALID' ||
+    maybeCode === 'REPO_SCOPE_MISMATCH' ||
+    maybeCode === 'REPO_SCOPE_UNINDEXED'
+  ) {
+    return {
+      code: maybeCode,
+      message: rawMessage,
+      recoverable: true,
+      suggestion: maybeSuggestion || 'Run autopology graph create --repo <path> --full and retry.',
+    };
+  }
   return {
     code: 'UNHANDLED_EXCEPTION',
     message: rawMessage,
@@ -1217,7 +1245,14 @@ function classifyToolError(error: unknown): {
 }
 
 function failedOutput(
-  code: 'PARSE_ERROR' | 'QUERY_TIMEOUT' | 'STALE_DATA' | 'UNHANDLED_EXCEPTION',
+  code:
+    | 'PARSE_ERROR'
+    | 'QUERY_TIMEOUT'
+    | 'STALE_DATA'
+    | 'REPO_SCOPE_INVALID'
+    | 'REPO_SCOPE_MISMATCH'
+    | 'REPO_SCOPE_UNINDEXED'
+    | 'UNHANDLED_EXCEPTION',
   message: string,
   recoverable: boolean,
   suggestion: string | undefined,

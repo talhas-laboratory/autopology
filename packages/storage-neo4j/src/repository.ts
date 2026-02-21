@@ -1,4 +1,4 @@
-import { edgeId, fileId, moduleId } from '@autopology/core';
+import { edgeId, fileId, moduleId, scopeNodeId, unscopeNodeId, type RepoScope } from '@autopology/core';
 import { openSession } from './driver.js';
 import type { Neo4jContext } from './driver.js';
 import {
@@ -30,16 +30,125 @@ export interface GraphFreshness {
   runtimeUpdatedAt?: string;
 }
 
+type RepoScopeFailureCode = 'REPO_SCOPE_INVALID' | 'REPO_SCOPE_MISMATCH' | 'REPO_SCOPE_UNINDEXED';
+
+export class RepoScopeError extends Error {
+  readonly code: RepoScopeFailureCode;
+  readonly suggestion?: string;
+
+  constructor(code: RepoScopeFailureCode, message: string, suggestion?: string) {
+    super(message);
+    this.code = code;
+    this.suggestion = suggestion;
+  }
+}
+
 export class GraphRepository {
   private readonly localMemo = new Map<string, { expiresAt: number; value: unknown }>();
   private readonly localMemoTtlMs = 1_500;
 
-  constructor(readonly ctx: Neo4jContext) {}
+  constructor(
+    readonly ctx: Neo4jContext,
+    readonly scope: RepoScope,
+  ) {}
+
+  private scopedId(localId: string): string {
+    return scopeNodeId(this.scope.repoKey, localId);
+  }
+
+  private localId(scopedOrLocalId: string): string {
+    return unscopeNodeId(this.scope.repoKey, scopedOrLocalId);
+  }
+
+  private scopedIds(localIds: string[]): string[] {
+    return localIds.map((id) => this.scopedId(id));
+  }
+
+  private scopeParams<T extends Record<string, unknown>>(params: T): T & {
+    scopePrefix: string;
+    repoKey: string;
+    graphMetaId: string;
+  } {
+    return {
+      ...params,
+      scopePrefix: this.scope.scopePrefix,
+      repoKey: this.scope.repoKey,
+      graphMetaId: this.scope.graphMetaId,
+    };
+  }
+
+  async ensureScopeReady(): Promise<void> {
+    const session = openSession(this.ctx);
+    try {
+      const res = await session.run(
+        `MATCH (m:GraphMeta {id: $graphMetaId})
+         RETURN m.repo_root AS repoRoot,
+                m.repo_key AS repoKey,
+                toString(m.indexed_at) AS indexedAt
+         LIMIT 1`,
+        this.scopeParams({}),
+      );
+      if (!res.records.length) {
+        throw new RepoScopeError(
+          'REPO_SCOPE_INVALID',
+          `Repo scope metadata missing for ${this.scope.repoRootCanonical}.`,
+          `Run autopology graph create --repo ${this.scope.repoRootInput} --full`,
+        );
+      }
+
+      const row = res.records[0];
+      const repoRoot = String(row.get('repoRoot') || '');
+      const repoKey = String(row.get('repoKey') || '');
+      const indexedAt = String(row.get('indexedAt') || '');
+
+      if (repoKey && repoKey !== this.scope.repoKey) {
+        throw new RepoScopeError(
+          'REPO_SCOPE_MISMATCH',
+          `Repo scope mismatch for ${this.scope.repoRootCanonical}.`,
+          `Run autopology graph create --repo ${this.scope.repoRootInput} --full`,
+        );
+      }
+      if (repoRoot && repoRoot !== this.scope.repoRootCanonical) {
+        throw new RepoScopeError(
+          'REPO_SCOPE_MISMATCH',
+          `Repo root mismatch for active scope: expected ${this.scope.repoRootCanonical}, found ${repoRoot}.`,
+          `Run autopology graph create --repo ${this.scope.repoRootInput} --full`,
+        );
+      }
+      if (!indexedAt) {
+        throw new RepoScopeError(
+          'REPO_SCOPE_UNINDEXED',
+          `No indexed graph is available for ${this.scope.repoRootCanonical}.`,
+          `Run autopology graph create --repo ${this.scope.repoRootInput} --full`,
+        );
+      }
+    } finally {
+      await session.close();
+    }
+  }
 
   async clearGraph(): Promise<void> {
     const session = openSession(this.ctx);
     try {
-      await session.run('MATCH (n) WHERE NOT n:GraphMeta DETACH DELETE n');
+      await session.run(
+        `MATCH (n:CodeNode)
+         WHERE n.id STARTS WITH $scopePrefix
+         DETACH DELETE n`,
+        this.scopeParams({}),
+      );
+      await session.run(
+        `MATCH (m:GraphMeta {id: $graphMetaId})
+         SET m.indexed_at = null,
+             m.commit_hash = null,
+             m.runtime_updated_at = null,
+             m.updated_at = datetime()`,
+        this.scopeParams({}),
+      );
+      await session.run(
+        `MATCH (w:WarmCache {repo_key: $repoKey})
+         DELETE w`,
+        this.scopeParams({}),
+      );
     } finally {
       await session.close();
     }
@@ -49,12 +158,12 @@ export class GraphRepository {
     const session = openSession(this.ctx);
     try {
       await session.run(
-        `MERGE (m:GraphMeta {id: 'graph-meta'})
+        `MERGE (m:GraphMeta {id: $graphMetaId})
          SET m.indexed_at = datetime(),
              m.graph_version = coalesce($graphVersion, m.graph_version, '1'),
              m.commit_hash = coalesce($commitHash, m.commit_hash),
              m.updated_at = datetime()`,
-        { graphVersion: graphVersion || null, commitHash: commitHash || null },
+        this.scopeParams({ graphVersion: graphVersion || null, commitHash: commitHash || null }),
       );
     } finally {
       await session.close();
@@ -65,12 +174,13 @@ export class GraphRepository {
     const session = openSession(this.ctx);
     try {
       const res = await session.run(
-        `MATCH (m:GraphMeta {id: 'graph-meta'})
+        `MATCH (m:GraphMeta {id: $graphMetaId})
          RETURN toString(m.indexed_at) AS indexedAt,
                 coalesce(m.graph_version,'1') AS graphVersion,
                 m.commit_hash AS commitHash,
                 toString(m.runtime_updated_at) AS runtimeUpdatedAt
          LIMIT 1`,
+        this.scopeParams({}),
       );
       if (!res.records.length) {
         return { graphVersion: '1' };
@@ -90,11 +200,12 @@ export class GraphRepository {
     const session = openSession(this.ctx);
     try {
       const res = await session.run(
-        `MATCH (m:GraphMeta {id: 'graph-meta'})
+        `MATCH (m:GraphMeta {id: $graphMetaId})
          RETURN coalesce(m.schema_version, 1) AS schemaVersion,
                 coalesce(m.graph_version, '1') AS graphVersion,
                 m.repo_root AS repoRoot
          LIMIT 1`,
+        this.scopeParams({}),
       );
       if (!res.records.length) {
         return { schemaVersion: 1, graphVersion: '1' };
@@ -115,35 +226,49 @@ export class GraphRepository {
     try {
       for (const node of nodes) {
         const labels = ['CodeNode', ...node.labels].map((v) => `:${v}`).join('');
+        const scopedNodeId = this.scopedId(node.id);
         await tx.run(
           `MERGE (n${labels} {id: $id})
            SET n += $props,
+               n.local_id = $localId,
+               n.repo_key = $repoKey,
                n.updated_at = datetime(),
                n.created_at = coalesce(n.created_at, datetime())`,
           {
-            id: node.id,
-            props: node.props,
+            id: scopedNodeId,
+            localId: node.id,
+            repoKey: this.scope.repoKey,
+            props: {
+              ...node.props,
+              repo_key: this.scope.repoKey,
+              local_id: node.id,
+            },
           },
         );
       }
 
       for (const edge of edges) {
+        const scopedSrc = this.scopedId(edge.src);
+        const scopedDst = this.scopedId(edge.dst);
         const eid = edge.id || edgeId({
           s: edge.src,
           d: edge.dst,
           t: edge.type,
+          repo: this.scope.repoKey,
           p: edge.props || {},
         });
         await tx.run(
           `MATCH (s:CodeNode {id: $src}), (d:CodeNode {id: $dst})
            MERGE (s)-[r:${edge.type} {id: $id}]->(d)
            SET r += $props,
+               r.repo_key = $repoKey,
                r.updated_at = datetime(),
                r.created_at = coalesce(r.created_at, datetime())`,
           {
-            src: edge.src,
-            dst: edge.dst,
+            src: scopedSrc,
+            dst: scopedDst,
             id: eid,
+            repoKey: this.scope.repoKey,
             props: edge.props || {},
           },
         );
@@ -160,12 +285,12 @@ export class GraphRepository {
 
   async deleteFileSubgraph(relPath: string): Promise<void> {
     const session = openSession(this.ctx);
-    const fid = fileId(relPath);
+    const fid = this.scopedId(fileId(relPath));
     try {
       await session.run(
         `MATCH (f:File {id: $fid})-[:CONTAINS*0..3]->(n)
          DETACH DELETE n`,
-        { fid },
+        this.scopeParams({ fid }),
       );
     } finally {
       await session.close();
@@ -175,7 +300,12 @@ export class GraphRepository {
   async listKnownFiles(): Promise<string[]> {
     const session = openSession(this.ctx);
     try {
-      const res = await session.run('MATCH (f:File) RETURN f.path AS path');
+      const res = await session.run(
+        `MATCH (f:File)
+         WHERE f.id STARTS WITH $scopePrefix
+         RETURN f.path AS path`,
+        this.scopeParams({}),
+      );
       return res.records.map((r) => String(r.get('path')));
     } finally {
       await session.close();
@@ -185,7 +315,12 @@ export class GraphRepository {
   async getFileSnapshot(): Promise<Record<string, string>> {
     const session = openSession(this.ctx);
     try {
-      const res = await session.run('MATCH (f:File) RETURN f.path AS path, coalesce(f.sha256,\'\') AS sha');
+      const res = await session.run(
+        `MATCH (f:File)
+         WHERE f.id STARTS WITH $scopePrefix
+         RETURN f.path AS path, coalesce(f.sha256,'') AS sha`,
+        this.scopeParams({}),
+      );
       const out: Record<string, string> = {};
       for (const row of res.records) {
         out[String(row.get('path'))] = String(row.get('sha') || '');
@@ -204,24 +339,28 @@ export class GraphRepository {
         `MERGE (m:CodeNode:Module {id: $moduleId})
          SET m.name = $name,
              m.path = $path,
+             m.local_id = $localId,
+             m.repo_key = $repoKey,
              m.estimated_tokens = coalesce(m.estimated_tokens, 16),
              m.priority_score = coalesce(m.priority_score, 0.8),
              m.updated_at = datetime(),
              m.created_at = coalesce(m.created_at, datetime())`,
-        {
-          moduleId: moduleId(top),
+        this.scopeParams({
+          moduleId: this.scopedId(moduleId(top)),
+          localId: moduleId(top),
           name: top,
           path: top,
-        },
+        }),
       );
       await session.run(
         `MATCH (m:Module {id: $moduleId}), (f:File {id: $fileId})
-         MERGE (m)-[:CONTAINS {id: $edgeId}]->(f)`,
-        {
-          moduleId: moduleId(top),
-          fileId: fileId(relPath),
-          edgeId: edgeId({ s: moduleId(top), d: fileId(relPath), t: 'CONTAINS', p: {} }),
-        },
+         MERGE (m)-[r:CONTAINS {id: $edgeId}]->(f)
+         SET r.repo_key = $repoKey`,
+        this.scopeParams({
+          moduleId: this.scopedId(moduleId(top)),
+          fileId: this.scopedId(fileId(relPath)),
+          edgeId: edgeId({ s: moduleId(top), d: fileId(relPath), t: 'CONTAINS', repo: this.scope.repoKey, p: {} }),
+        }),
       );
     } finally {
       await session.close();
@@ -233,20 +372,25 @@ export class GraphRepository {
     try {
       await session.run(
         `MATCH (t:TestCase {path: $path})
+         WHERE t.id STARTS WITH $scopePrefix
          UNWIND coalesce(t.called_names, []) AS called
          MATCH (f:Function)
-         WHERE toLower(f.name) = toLower(called)
+         WHERE f.id STARTS WITH $scopePrefix
+           AND (
+                toLower(f.name) = toLower(called)
             OR toLower(f.qualname) = toLower(called)
             OR toLower(f.qualname) ENDS WITH '.' + toLower(called)
+           )
          MERGE (t)-[r:TESTS {id: $prefix + ':' + t.id + ':' + f.id}]->(f)
          SET r.confidence = 0.62,
+             r.repo_key = $repoKey,
              r.reason = 'called_name_heuristic',
              r.updated_at = datetime(),
              r.created_at = coalesce(r.created_at, datetime())`,
-        {
+        this.scopeParams({
           path: relPath,
           prefix: 'tests',
-        },
+        }),
       );
     } finally {
       await session.close();
@@ -256,9 +400,24 @@ export class GraphRepository {
   async getCounts(): Promise<{ files: number; nodes: number; edges: number }> {
     const session = openSession(this.ctx);
     try {
-      const filesRes = await session.run('MATCH (f:File) RETURN count(f) AS n');
-      const nodesRes = await session.run('MATCH (n:CodeNode) RETURN count(n) AS n');
-      const edgesRes = await session.run('MATCH ()-[r]->() RETURN count(r) AS n');
+      const filesRes = await session.run(
+        `MATCH (f:File)
+         WHERE f.id STARTS WITH $scopePrefix
+         RETURN count(f) AS n`,
+        this.scopeParams({}),
+      );
+      const nodesRes = await session.run(
+        `MATCH (n:CodeNode)
+         WHERE n.id STARTS WITH $scopePrefix
+         RETURN count(n) AS n`,
+        this.scopeParams({}),
+      );
+      const edgesRes = await session.run(
+        `MATCH (s:CodeNode)-[r]->(d:CodeNode)
+         WHERE s.id STARTS WITH $scopePrefix AND d.id STARTS WITH $scopePrefix
+         RETURN count(r) AS n`,
+        this.scopeParams({}),
+      );
       return {
         files: Number(filesRes.records[0].get('n')),
         nodes: Number(nodesRes.records[0].get('n')),
@@ -274,40 +433,55 @@ export class GraphRepository {
     try {
       const countsRes = await session.run(
         `MATCH (f:File)
+         WHERE f.id STARTS WITH $scopePrefix
          WITH count(f) AS fileCount
          MATCH (n:CodeNode)
+         WHERE n.id STARTS WITH $scopePrefix
          WITH fileCount, count(n) AS nodeCount
-         MATCH ()-[r]->()
+         MATCH (s:CodeNode)-[r]->(d:CodeNode)
+         WHERE s.id STARTS WITH $scopePrefix AND d.id STARTS WITH $scopePrefix
          RETURN fileCount, nodeCount, count(r) AS edgeCount`,
+        this.scopeParams({}),
       );
       const modulesRes = await session.run(
         `MATCH (m:Module)
+         WHERE m.id STARTS WITH $scopePrefix
          RETURN m.name AS name
          ORDER BY m.name ASC
          LIMIT 20`,
+        this.scopeParams({}),
       );
       const conceptsRes = await session.run(
         `MATCH (c:Concept)
-         OPTIONAL MATCH (:CodeNode)-[:IMPLEMENTS]->(c)
+         WHERE c.id STARTS WITH $scopePrefix
+         OPTIONAL MATCH (n:CodeNode)-[:IMPLEMENTS]->(c)
+         WHERE n.id STARTS WITH $scopePrefix
          RETURN c.name AS name, count(*) AS impls
          ORDER BY impls DESC, name ASC
          LIMIT 12`,
+        this.scopeParams({}),
       );
       const entryRes = await session.run(
         `MATCH (f:Function)
-         WHERE toLower(coalesce(f.name,'')) CONTAINS 'main'
+         WHERE f.id STARTS WITH $scopePrefix
+           AND (
+               toLower(coalesce(f.name,'')) CONTAINS 'main'
             OR toLower(coalesce(f.name,'')) CONTAINS 'handler'
             OR toLower(coalesce(f.name,'')) CONTAINS 'controller'
             OR toLower(coalesce(f.path,'')) CONTAINS '/api/'
             OR toLower(coalesce(f.path,'')) CONTAINS '/routes/'
+           )
          RETURN coalesce(f.path, f.id) AS entry
          ORDER BY entry ASC
          LIMIT 20`,
+        this.scopeParams({}),
       );
       const langsRes = await session.run(
         `MATCH (f:File)
+         WHERE f.id STARTS WITH $scopePrefix
          WITH collect(DISTINCT toLower(coalesce(f.language,''))) AS langs
          RETURN [l IN langs WHERE l <> '' | l] AS langs`,
+        this.scopeParams({}),
       );
 
       const counts = countsRes.records[0];
@@ -347,13 +521,16 @@ export class GraphRepository {
 
       const res = await session.run(
         `MATCH (n:CodeNode)
-         WHERE size($tokens) = 0
+         WHERE n.id STARTS WITH $scopePrefix
+           AND (
+               size($tokens) = 0
             OR any(tok IN $tokens WHERE
                  toLower(coalesce(n.name,'')) CONTAINS tok
               OR toLower(coalesce(n.qualname,'')) CONTAINS tok
               OR toLower(coalesce(n.summary,'')) CONTAINS tok
               OR toLower(coalesce(n.path,'')) CONTAINS tok
             )
+           )
          RETURN n.id AS id, labels(n) AS labels, n.name AS name, n.qualname AS qualname, n.path AS path,
                 coalesce(n.summary, '') AS summary,
                 coalesce(n.priority_score, 0.5) AS priorityScore,
@@ -361,13 +538,14 @@ export class GraphRepository {
                 size([(:CodeNode)-[:DEPENDS_ON|CALLS|IMPORTS]->(n) | 1]) AS degree
          ORDER BY coalesce(n.priority_score, 0.5) DESC, coalesce(n.name, n.qualname, n.id) ASC
          LIMIT toInteger($candidateLimit)`,
-        { tokens: queryTokens, candidateLimit },
+        this.scopeParams({ tokens: queryTokens, candidateLimit }),
       );
 
       let rows = res.records;
       if (!rows.length && queryTokens.length) {
         const fallback = await session.run(
           `MATCH (n:CodeNode)
+           WHERE n.id STARTS WITH $scopePrefix
            RETURN n.id AS id, labels(n) AS labels, n.name AS name, n.qualname AS qualname, n.path AS path,
                   coalesce(n.summary, '') AS summary,
                   coalesce(n.priority_score, 0.5) AS priorityScore,
@@ -375,7 +553,7 @@ export class GraphRepository {
                   size([(:CodeNode)-[:DEPENDS_ON|CALLS|IMPORTS]->(n) | 1]) AS degree
            ORDER BY coalesce(n.priority_score, 0.5) DESC, coalesce(n.name, n.qualname, n.id) ASC
            LIMIT toInteger($candidateLimit)`,
-          { candidateLimit: Math.min(250, candidateLimit) },
+          this.scopeParams({ candidateLimit: Math.min(250, candidateLimit) }),
         );
         rows = fallback.records;
       }
@@ -384,7 +562,7 @@ export class GraphRepository {
         rows
           .map((r) => {
             const input: RetrievalCandidateInput = {
-              id: String(r.get('id')),
+              id: this.localId(String(r.get('id'))),
               labels: (r.get('labels') as string[]) || [],
               name: (r.get('name') as string | null) || undefined,
               qualname: (r.get('qualname') as string | null) || undefined,
@@ -437,7 +615,7 @@ export class GraphRepository {
                 collect(DISTINCT dep.name)[0..20] AS dependencies,
                 collect(DISTINCT dep2.name)[0..20] AS dependents,
                 count(DISTINCT tc) AS testCount`,
-        { id: moduleNodeId },
+        this.scopeParams({ id: this.scopedId(moduleNodeId) }),
       );
       if (!moduleRes.records.length) return null;
 
@@ -446,18 +624,21 @@ export class GraphRepository {
          WITH [n IN nodes(p) WHERE n:Module | n.name] AS cycle
          RETURN cycle
          LIMIT 10`,
-        { id: moduleNodeId },
+        this.scopeParams({ id: this.scopedId(moduleNodeId) }),
       );
       const orphanRes = await session.run(
         `MATCH (m:Module)
-         WHERE NOT (m)-[:DEPENDS_ON]->(:Module)
+         WHERE m.id STARTS WITH $scopePrefix
+           AND NOT (m)-[:DEPENDS_ON]->(:Module)
            AND NOT (:Module)-[:DEPENDS_ON]->(m)
          RETURN m.name AS name
          ORDER BY name ASC
          LIMIT 25`,
+        this.scopeParams({}),
       );
       const couplingRes = await session.run(
         `MATCH (m:Module)
+         WHERE m.id STARTS WITH $scopePrefix
          OPTIONAL MATCH (m)-[:DEPENDS_ON]->(d:Module)
          WITH m, count(DISTINCT d) AS outDegree
          OPTIONAL MATCH (u:Module)-[:DEPENDS_ON]->(m)
@@ -466,6 +647,7 @@ export class GraphRepository {
          RETURN m.name AS module, inDegree, outDegree, coupling
          ORDER BY coupling DESC, module ASC
          LIMIT 12`,
+        this.scopeParams({}),
       );
       const moduleCouplingRes = await session.run(
         `MATCH (m:Module {id: $id})
@@ -474,7 +656,7 @@ export class GraphRepository {
          OPTIONAL MATCH (u:Module)-[:DEPENDS_ON]->(m)
          WITH count(DISTINCT u) AS inDegree, outDegree
          RETURN (inDegree + outDegree) AS coupling`,
-        { id: moduleNodeId },
+        this.scopeParams({ id: this.scopedId(moduleNodeId) }),
       );
 
       const row = moduleRes.records[0];
@@ -520,25 +702,28 @@ export class GraphRepository {
   async traceImpact(nodeId: string, depth = 2, direction: 'upstream' | 'downstream' | 'both' = 'both') {
     const session = openSession(this.ctx);
     try {
+      const scopedTarget = this.scopedId(nodeId);
       const upstream = direction === 'downstream'
         ? []
         : await session.run(
             `MATCH path = (d:CodeNode)-[:DEPENDS_ON|CALLS|IMPORTS*1..${depth}]->(t:CodeNode {id: $nodeId})
+             WHERE d.id STARTS WITH $scopePrefix
              WITH d, min(length(path)) AS distance
              RETURN d.id AS id, coalesce(d.name, d.qualname, d.id) AS name, distance
              ORDER BY distance ASC
              LIMIT 100`,
-            { nodeId },
+            this.scopeParams({ nodeId: scopedTarget }),
           );
       const downstream = direction === 'upstream'
         ? []
         : await session.run(
             `MATCH path = (t:CodeNode {id: $nodeId})-[:DEPENDS_ON|CALLS|IMPORTS*1..${depth}]->(d:CodeNode)
+             WHERE d.id STARTS WITH $scopePrefix
              WITH d, min(length(path)) AS distance
              RETURN d.id AS id, coalesce(d.name, d.qualname, d.id) AS name, distance
              ORDER BY distance ASC
              LIMIT 100`,
-            { nodeId },
+            this.scopeParams({ nodeId: scopedTarget }),
           );
 
       return {
@@ -547,7 +732,7 @@ export class GraphRepository {
           ? []
           : upstream.records.map((r) => ({
               node: r.get('name'),
-              id: r.get('id'),
+              id: this.localId(String(r.get('id'))),
               distance: Number(r.get('distance')),
               criticality: criticalityFromDistance(Number(r.get('distance'))),
               confidence: 0.82,
@@ -556,7 +741,7 @@ export class GraphRepository {
           ? []
           : downstream.records.map((r) => ({
               node: r.get('name'),
-              id: r.get('id'),
+              id: this.localId(String(r.get('id'))),
               distance: Number(r.get('distance')),
               criticality: criticalityFromDistance(Number(r.get('distance'))),
               confidence: 0.82,
@@ -578,7 +763,8 @@ export class GraphRepository {
       const instanceToken = normalizeToken(opts?.instanceId || '');
       const res = await session.run(
         `MATCH (o:DataObject)
-         WHERE toLower(o.name) CONTAINS toLower($objectType)
+         WHERE o.id STARTS WITH $scopePrefix
+           AND toLower(o.name) CONTAINS toLower($objectType)
          OPTIONAL MATCH (f:Field)-[:BELONGS_TO]->(o)
          WHERE $field IS NULL OR toLower(f.name) CONTAINS toLower($field)
          OPTIONAL MATCH (writer:CodeNode)-[w:WRITES]->(f)
@@ -628,7 +814,7 @@ export class GraphRepository {
                         | coalesce(rc.name, rc.qualname, rc.id)][0..5]
                     ELSE [] END, [])
                 })[0..40] AS reads`,
-        { objectType, field: field || null, trackPersistence },
+        this.scopeParams({ objectType, field: field || null, trackPersistence }),
       );
 
       const directSteps: Array<Record<string, unknown>> = [];
@@ -650,8 +836,8 @@ export class GraphRepository {
             step: i++,
             object_type: row.get('object_name'),
             field: row.get('field_name'),
-            location: step.node,
-            node_id: step.node_id ?? null,
+            location: this.localId(String(step.node || '')),
+            node_id: step.node_id ? this.localId(String(step.node_id)) : null,
             transform: step.type,
             line: step.line ?? null,
             confidence: Number(step.confidence ?? (step.type === 'TRANSFORM' ? 0.74 : 0.82)),
@@ -666,7 +852,7 @@ export class GraphRepository {
         }
       }
 
-      const baseNodeIds = [...new Set(directSteps.map((step) => String(step.node_id || '')).filter(Boolean))];
+      const baseNodeIds = this.scopedIds([...new Set(directSteps.map((step) => String(step.node_id || '')).filter(Boolean))]);
       const inferredSteps: Array<Record<string, unknown>> = [];
       if (baseNodeIds.length > 0) {
         const inferredRes = await session.run(
@@ -677,6 +863,7 @@ export class GraphRepository {
            MATCH path = (caller:CodeNode)-[:CALLS*1..2]->(base)
            WITH o, f, caller, base, flow, min(length(path)) AS depth
            WHERE caller.id <> base.id
+             AND caller.id STARTS WITH $scopePrefix
            RETURN o.name AS object_name,
                   f.name AS field_name,
                   coalesce(caller.name, caller.qualname, caller.id) AS caller_name,
@@ -695,12 +882,12 @@ export class GraphRepository {
                   ) AS persistence_targets
            ORDER BY depth ASC, caller_name ASC
            LIMIT 500`,
-          {
+          this.scopeParams({
             baseNodeIds,
             objectType,
             field: field || null,
             trackPersistence,
-          },
+          }),
         );
 
         for (const row of inferredRes.records) {
@@ -710,16 +897,16 @@ export class GraphRepository {
           inferredSteps.push({
             object_type: row.get('object_name'),
             field: row.get('field_name'),
-            location: row.get('caller_name'),
-            node_id: row.get('caller_id'),
+            location: this.localId(String(row.get('caller_name') || '')),
+            node_id: this.localId(String(row.get('caller_id'))),
             transform: flowEdgeToAction(flowType),
             line: null,
             confidence: interproceduralFlowConfidence(Number(row.get('base_confidence') || 0.72), depth),
             partial_trace: true,
             trace_kind: 'interprocedural',
             flow_depth: depth,
-            via_node: row.get('via_name'),
-            via_node_id: row.get('via_id'),
+            via_node: this.localId(String(row.get('via_name') || '')),
+            via_node_id: this.localId(String(row.get('via_id'))),
             persistence: trackPersistence ? persistenceTargets.length > 0 : undefined,
             persistence_targets: trackPersistence ? persistenceTargets : undefined,
           });
@@ -858,23 +1045,26 @@ export class GraphRepository {
       const targetsRes = await session.run(
         `UNWIND $aliases AS alias
          MATCH (f:Function)
-         WHERE toLower(coalesce(f.name,'')) = alias
+         WHERE f.id STARTS WITH $scopePrefix
+           AND (
+               toLower(coalesce(f.name,'')) = alias
             OR toLower(coalesce(f.qualname,'')) = alias
             OR toLower(coalesce(f.qualname,'')) ENDS WITH '.' + alias
             OR toLower(coalesce(f.name,'')) CONTAINS alias
             OR toLower(coalesce(f.qualname,'')) CONTAINS alias
+           )
          RETURN DISTINCT f.id AS id,
                 coalesce(f.name, f.qualname, f.id) AS name,
                 f.path AS path
          LIMIT 60`,
-        { aliases },
+        this.scopeParams({ aliases }),
       );
       const targetFunctions = targetsRes.records.map((row) => ({
-        id: String(row.get('id')),
+        id: this.localId(String(row.get('id'))),
         name: String(row.get('name')),
         path: String(row.get('path') || ''),
       }));
-      const targetIds = targetFunctions.map((item) => item.id);
+      const targetIds = this.scopedIds(targetFunctions.map((item) => item.id));
 
       const testsByPath = new Map<string, { file: string; coverage: number; confidence: number; reason: string }>();
       const upsert = (candidate: { file: string; coverage?: number; confidence?: number; reason?: string }) => {
@@ -898,10 +1088,11 @@ export class GraphRepository {
            MATCH (f:Function {id: targetId})
            OPTIONAL MATCH (t:TestCase)-[rel:TESTS]->(f)
            WHERE t.path IS NOT NULL
+             AND t.id STARTS WITH $scopePrefix
            RETURN DISTINCT t.path AS path,
                   coalesce(t.coverage, 0) AS coverage,
                   coalesce(rel.confidence, 0.92) AS confidence`,
-          { targetIds },
+          this.scopeParams({ targetIds }),
         );
         for (const row of directRes.records) {
           upsert({
@@ -917,6 +1108,7 @@ export class GraphRepository {
            MATCH (target:Function {id: targetId})
            MATCH p = (caller:Function)-[:CALLS*1..3]->(target)
            WHERE caller.id <> target.id
+             AND caller.id STARTS WITH $scopePrefix
              AND (
                toLower(coalesce(caller.path,'')) CONTAINS '/test'
                OR toLower(coalesce(caller.path,'')) CONTAINS '.test.'
@@ -927,7 +1119,7 @@ export class GraphRepository {
            WITH caller.path AS path, min(length(p)) AS hops
            RETURN path, hops
            LIMIT 120`,
-          { targetIds },
+          this.scopeParams({ targetIds }),
         );
         for (const row of chainRes.records) {
           const hops = Math.max(1, Number(row.get('hops') || 1));
@@ -942,14 +1134,15 @@ export class GraphRepository {
       const aliasRes = await session.run(
         `UNWIND $aliases AS alias
          MATCH (t:TestCase)
-         WHERE any(called IN coalesce(t.called_names, [])
+         WHERE t.id STARTS WITH $scopePrefix
+           AND any(called IN coalesce(t.called_names, [])
            WHERE toLower(called) = alias
               OR toLower(called) ENDS WITH '.' + alias
               OR toLower(called) CONTAINS alias
          )
          RETURN DISTINCT t.path AS path, coalesce(t.coverage, 0) AS coverage
          LIMIT 80`,
-        { aliases },
+        this.scopeParams({ aliases }),
       );
       for (const row of aliasRes.records) {
         upsert({
@@ -991,8 +1184,11 @@ export class GraphRepository {
     try {
       const res = await session.run(
         `MATCH (f:File)
-         WHERE toLower(f.path) = $pathLower
+         WHERE f.id STARTS WITH $scopePrefix
+           AND (
+               toLower(f.path) = $pathLower
             OR toLower(f.path) ENDS WITH '/' + $pathLower
+           )
          WITH f,
               CASE WHEN toLower(f.path) = $pathLower THEN 2 ELSE 1 END AS exactness
          ORDER BY exactness DESC, size(split(coalesce(f.path,''), '/')) ASC
@@ -1005,13 +1201,13 @@ export class GraphRepository {
                 count(DISTINCT fn) AS functionCount,
                 count(DISTINCT tc) AS testCount,
                 exactness`,
-        { pathLower: normalized.toLowerCase() },
+        this.scopeParams({ pathLower: normalized.toLowerCase() }),
       );
       if (!res.records.length) return null;
       const row = res.records[0];
       const canonicalPath = String(row.get('path') || normalized);
       return {
-        id: String(row.get('id')),
+        id: this.localId(String(row.get('id'))),
         type: 'file',
         path: canonicalPath,
         language: String(row.get('language') || ''),
@@ -1040,10 +1236,11 @@ export class GraphRepository {
     try {
       const fnRes = await session.run(
         `MATCH (f:File {path: $path})-[:CONTAINS]->(fn:Function)
+         WHERE f.id STARTS WITH $scopePrefix AND fn.id STARTS WITH $scopePrefix
          RETURN DISTINCT coalesce(fn.name, fn.qualname, fn.id) AS fnName
          ORDER BY fnName ASC
          LIMIT 16`,
-        { path: canonicalPath },
+        this.scopeParams({ path: canonicalPath }),
       );
       const functionTargets = fnRes.records
         .map((row) => String(row.get('fnName') || ''))
@@ -1138,6 +1335,7 @@ export class GraphRepository {
         const hotspotsRes = await session.run(
           `MATCH (w:RuntimeWindow)
            WHERE w.bucket_start >= datetime($sinceIso)
+             AND w.repo_key = $repoKey
            OPTIONAL MATCH (callee:CodeNode {id: w.callee_id})
            RETURN w.callee_id AS calleeId,
                   coalesce(callee.name, callee.qualname, w.callee_id) AS calleeName,
@@ -1146,11 +1344,12 @@ export class GraphRepository {
                   sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration
            ORDER BY samples DESC
            LIMIT 25`,
-          { sinceIso },
+          this.scopeParams({ sinceIso }),
         );
         const failuresRes = await session.run(
           `MATCH (w:RuntimeWindow)
            WHERE w.bucket_start >= datetime($sinceIso)
+             AND w.repo_key = $repoKey
              AND coalesce(w.error_count, 0) > 0
            RETURN toString(w.bucket_start) AS windowStart,
                   w.caller_id AS callerId,
@@ -1160,7 +1359,7 @@ export class GraphRepository {
                   w.avg_duration_ms AS avgDuration
            ORDER BY w.bucket_start DESC, errors DESC
            LIMIT 15`,
-          { sinceIso },
+          this.scopeParams({ sinceIso }),
         );
 
         const hotspots = hotspotsRes.records.map((row) => {
@@ -1169,7 +1368,7 @@ export class GraphRepository {
           const weightedDuration = Number(row.get('weightedDuration') || 0);
           return {
             function: row.get('calleeName'),
-            id: row.get('calleeId'),
+            id: this.localId(String(row.get('calleeId'))),
             samples,
             avg_duration_ms: samples > 0 ? roundTo(weightedDuration / samples, 2) : 0,
             error_rate: samples > 0 ? roundTo(errors / samples, 4) : 0,
@@ -1189,8 +1388,8 @@ export class GraphRepository {
           hot_path: hotspots.length > 0,
           recent_failures: failuresRes.records.map((row) => ({
             time: row.get('windowStart'),
-            caller: row.get('callerId'),
-            callee: row.get('calleeId'),
+            caller: this.localId(String(row.get('callerId'))),
+            callee: this.localId(String(row.get('calleeId'))),
             error_count: Number(row.get('errors') || 0),
             samples: Number(row.get('samples') || 0),
             avg_duration_ms: Number(row.get('avgDuration') || 0),
@@ -1221,20 +1420,23 @@ export class GraphRepository {
     }
 
     const targetId = targetIds[0];
+    const scopedTargetId = this.scopedId(targetId);
     const session = openSession(this.ctx);
     try {
       const incomingRes = await session.run(
         `MATCH (w:RuntimeWindow {callee_id: $targetId})
          WHERE w.bucket_start >= datetime($sinceIso)
+           AND w.repo_key = $repoKey
          RETURN sum(w.samples) AS samples,
                 sum(w.error_count) AS errors,
                 sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration,
                 max(w.last_seen) AS lastSeen`,
-        { targetId, sinceIso },
+        this.scopeParams({ targetId: scopedTargetId, sinceIso }),
       );
       const byCallerRes = await session.run(
         `MATCH (w:RuntimeWindow {callee_id: $targetId})
          WHERE w.bucket_start >= datetime($sinceIso)
+           AND w.repo_key = $repoKey
          OPTIONAL MATCH (caller:CodeNode {id: w.caller_id})
          RETURN w.caller_id AS callerId,
                 coalesce(caller.name, caller.qualname, w.caller_id) AS callerName,
@@ -1244,11 +1446,12 @@ export class GraphRepository {
                 max(w.last_seen) AS lastSeen
          ORDER BY samples DESC
          LIMIT 12`,
-        { targetId, sinceIso },
+        this.scopeParams({ targetId: scopedTargetId, sinceIso }),
       );
       const outgoingRes = await session.run(
         `MATCH (w:RuntimeWindow {caller_id: $targetId})
          WHERE w.bucket_start >= datetime($sinceIso)
+           AND w.repo_key = $repoKey
          OPTIONAL MATCH (callee:CodeNode {id: w.callee_id})
          RETURN w.callee_id AS calleeId,
                 coalesce(callee.name, callee.qualname, w.callee_id) AS calleeName,
@@ -1257,11 +1460,12 @@ export class GraphRepository {
                 sum(toFloat(w.avg_duration_ms) * toFloat(w.samples)) AS weightedDuration
          ORDER BY samples DESC
          LIMIT 12`,
-        { targetId, sinceIso },
+        this.scopeParams({ targetId: scopedTargetId, sinceIso }),
       );
       const failuresRes = await session.run(
         `MATCH (w:RuntimeWindow {callee_id: $targetId})
          WHERE w.bucket_start >= datetime($sinceIso)
+           AND w.repo_key = $repoKey
            AND coalesce(w.error_count, 0) > 0
          RETURN toString(w.bucket_start) AS windowStart,
                 w.caller_id AS callerId,
@@ -1270,7 +1474,7 @@ export class GraphRepository {
                 w.avg_duration_ms AS avgDuration
          ORDER BY w.bucket_start DESC, errors DESC
          LIMIT 10`,
-        { targetId, sinceIso },
+        this.scopeParams({ targetId: scopedTargetId, sinceIso }),
       );
 
       const incoming = incomingRes.records[0];
@@ -1318,7 +1522,7 @@ export class GraphRepository {
         const weightedDuration = Number(row.get('weightedDuration') || 0);
         return {
           caller: row.get('callerName'),
-          id: row.get('callerId'),
+          id: this.localId(String(row.get('callerId'))),
           samples,
           avg_duration_ms: samples > 0 ? roundTo(weightedDuration / samples, 2) : 0,
           error_rate: samples > 0 ? roundTo(errors / samples, 4) : 0,
@@ -1332,7 +1536,7 @@ export class GraphRepository {
         const weightedDuration = Number(row.get('weightedDuration') || 0);
         return {
           callee: row.get('calleeName'),
-          id: row.get('calleeId'),
+          id: this.localId(String(row.get('calleeId'))),
           samples,
           avg_duration_ms: samples > 0 ? roundTo(weightedDuration / samples, 2) : 0,
           error_rate: samples > 0 ? roundTo(errors / samples, 4) : 0,
@@ -1354,7 +1558,7 @@ export class GraphRepository {
         hot_path: incomingSamples >= 50 || avgDuration >= 200 || errorRate >= 0.05,
         recent_failures: failuresRes.records.map((row) => ({
           time: row.get('windowStart'),
-          caller: row.get('callerId'),
+          caller: this.localId(String(row.get('callerId'))),
           error_count: Number(row.get('errors') || 0),
           samples: Number(row.get('samples') || 0),
           avg_duration_ms: Number(row.get('avgDuration') || 0),
@@ -1429,20 +1633,22 @@ export class GraphRepository {
         `UNWIND $ids AS id
          MATCH (n:CodeNode {id: id})
          OPTIONAL MATCH (n)-[:DEPENDS_ON|CALLS|IMPORTS]->(dep:CodeNode)
+         WHERE dep.id STARTS WITH $scopePrefix
          OPTIONAL MATCH (t:TestCase)-[:TESTS]->(n)
+         WHERE t.id STARTS WITH $scopePrefix
          RETURN id AS id,
                 coalesce(n.name, n.qualname, n.id) AS name,
                 n.path AS path,
                 collect(DISTINCT coalesce(dep.name, dep.qualname, dep.id))[0..10] AS deps,
                 collect(DISTINCT t.path)[0..10] AS tests`,
-        { ids: uniqueIds },
+        this.scopeParams({ ids: this.scopedIds(uniqueIds) }),
       );
 
       const targets = res.records.map((row) => ({
-        id: row.get('id'),
+        id: this.localId(String(row.get('id'))),
         name: row.get('name'),
-        path: row.get('path') || row.get('id'),
-        dependencies: row.get('deps') as string[],
+        path: row.get('path') || this.localId(String(row.get('id'))),
+        dependencies: ((row.get('deps') as string[]) || []).map((dep) => this.localId(String(dep))),
         tests: row.get('tests') as string[],
       }));
 
@@ -1486,6 +1692,7 @@ export class GraphRepository {
       let res = await session.run(
         `MATCH (w:RuntimeWindow)
          WHERE w.bucket_start >= datetime($sinceIso)
+           AND w.repo_key = $repoKey
            AND coalesce(w.error_count, 0) > 0
            AND (
              toLower(coalesce(w.id, '')) CONTAINS $q OR
@@ -1505,13 +1712,14 @@ export class GraphRepository {
                 w.avg_duration_ms AS avgDuration
          ORDER BY errors DESC, samples DESC
          LIMIT 50`,
-        { sinceIso, q },
+        this.scopeParams({ sinceIso, q }),
       );
 
       if (!res.records.length) {
         res = await session.run(
           `MATCH (w:RuntimeWindow)
            WHERE w.bucket_start >= datetime($sinceIso)
+             AND w.repo_key = $repoKey
              AND coalesce(w.error_count, 0) > 0
            OPTIONAL MATCH (c:CodeNode {id: w.caller_id})
            OPTIONAL MATCH (d:CodeNode {id: w.callee_id})
@@ -1526,17 +1734,17 @@ export class GraphRepository {
                   w.avg_duration_ms AS avgDuration
            ORDER BY errors DESC, samples DESC
            LIMIT 30`,
-          { sinceIso },
+          this.scopeParams({ sinceIso }),
         );
       }
 
       const traces = res.records.map((row) => ({
-        trace_id: row.get('id'),
+        trace_id: this.localId(String(row.get('id'))),
         window_start: row.get('bucketStart'),
         caller: row.get('callerName'),
-        caller_id: row.get('callerId'),
+        caller_id: this.localId(String(row.get('callerId'))),
         callee: row.get('calleeName'),
-        callee_id: row.get('calleeId'),
+        callee_id: this.localId(String(row.get('calleeId'))),
         samples: Number(row.get('samples') || 0),
         error_count: Number(row.get('errors') || 0),
         avg_duration_ms: Number(row.get('avgDuration') || 0),
@@ -1596,8 +1804,10 @@ export class GraphRepository {
   async getRuntimeSnapshot(nodeId: string): Promise<Record<string, unknown> | null> {
     const session = openSession(this.ctx);
     try {
+      const scopedNodeId = this.scopedId(nodeId);
       const res = await session.run(
         `MATCH (s:CodeNode {id: $id})-[r:OBSERVED_CALL]->(d:CodeNode)
+         WHERE d.id STARTS WITH $scopePrefix
          RETURN d.id AS callee,
                 r.samples AS samples,
                 r.avg_duration_ms AS avgDuration,
@@ -1605,13 +1815,13 @@ export class GraphRepository {
                 toString(r.last_seen) AS lastSeen
          ORDER BY samples DESC
          LIMIT 20`,
-        { id: nodeId },
+        this.scopeParams({ id: scopedNodeId }),
       );
       if (!res.records.length) return null;
       return {
         node_id: nodeId,
         observed_calls: res.records.map((row) => ({
-          callee: row.get('callee'),
+          callee: this.localId(String(row.get('callee'))),
           samples: Number(row.get('samples') || 0),
           avg_duration_ms: Number(row.get('avgDuration') || 0),
           error_count: Number(row.get('errors') || 0),
@@ -1695,6 +1905,7 @@ export class GraphRepository {
       try {
         const coupling = await session.run(
           `MATCH (m:Module)
+           WHERE m.id STARTS WITH $scopePrefix
            OPTIONAL MATCH (m)-[:DEPENDS_ON]->(d:Module)
            WITH m, count(DISTINCT d) AS outDegree
            OPTIONAL MATCH (u:Module)-[:DEPENDS_ON]->(m)
@@ -1703,6 +1914,7 @@ export class GraphRepository {
            RETURN m.name AS module, inDegree, outDegree, coupling
            ORDER BY coupling DESC, module ASC
            LIMIT 10`,
+          this.scopeParams({}),
         );
 
         return {

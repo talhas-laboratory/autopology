@@ -6,5 +6,6 @@ export * from './config.js';
 export * from './ids.js';
 export * from './progressive.js';
 export * from './security.js';
+export * from './scope.js';
 export * from './token.js';
 export * from './types.js';

@@ -4,6 +4,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { Command } from 'commander';
 import {
+  deriveRepoScope,
   loadConfig,
   writeDefaultConfig,
 } from '@autopology/core';
@@ -105,10 +106,11 @@ function resolveOutputPathUnderRepo(repoRoot: string, outputPath: string): strin
 
 async function withRepo<T>(repoRoot: string, fn: (repo: GraphRepository) => Promise<T>): Promise<T> {
   const cfg = loadConfig(repoRoot);
+  const scope = deriveRepoScope(repoRoot);
   const ctx = createNeo4jContext(cfg.neo4j);
   try {
-    await initSchema(ctx, repoRoot);
-    const repo = new GraphRepository(ctx);
+    await initSchema(ctx, scope);
+    const repo = new GraphRepository(ctx, scope);
     return await fn(repo);
   } finally {
     await closeNeo4j(ctx);
@@ -121,7 +123,7 @@ async function invalidateWarmCache(repo: GraphRepository, result: unknown): Prom
   if (!Array.isArray(impacted) || impacted.length === 0) return;
   const nodeIds = impacted.filter((x): x is string => typeof x === 'string');
   if (!nodeIds.length) return;
-  const warm = new Neo4jWarmCache(repo.ctx);
+  const warm = new Neo4jWarmCache(repo.ctx, repo.scope.repoKey);
   await warm.invalidateByNodes(nodeIds);
 }
 
@@ -136,16 +138,17 @@ async function runIndex(repoRoot: string, mode: IndexMode): Promise<unknown> {
 
 async function runDoctorChecks(repoRoot: string): Promise<DoctorReport> {
   const cfg = loadConfig(repoRoot);
+  const scope = deriveRepoScope(repoRoot);
   const ctx = createNeo4jContext(cfg.neo4j);
   const checks: Array<Record<string, unknown>> = [];
   try {
     await verifyConnection(ctx);
     checks.push({ check: 'neo4j_connectivity', ok: true });
 
-    await initSchema(ctx, repoRoot);
+    await initSchema(ctx, scope);
     checks.push({ check: 'schema_init', ok: true });
 
-    const repo = new GraphRepository(ctx);
+    const repo = new GraphRepository(ctx, scope);
     const meta = await repo.getMeta();
     checks.push({ check: 'schema_version', ok: meta.schemaVersion >= 4, schema_version: meta.schemaVersion });
     const counts = await repo.getCounts();
@@ -326,6 +329,20 @@ graph
     console.log(JSON.stringify({ ok: true, repo_root: repoRoot, mode, result }, null, 2));
   });
 
+graph
+  .command('prune')
+  .option('--repo <path>', 'repo root')
+  .description('Remove graph data for only the active repo scope')
+  .action(async (opts: { repo?: string }) => {
+    const repoRoot = resolveRepoRoot(opts.repo);
+    await withRepo(repoRoot, async (repo) => {
+      await repo.clearGraph();
+      const warm = new Neo4jWarmCache(repo.ctx, repo.scope.repoKey);
+      await warm.invalidateAll();
+    });
+    console.log(JSON.stringify({ ok: true, repo_root: repoRoot, action: 'pruned' }, null, 2));
+  });
+
 program
   .command('watch')
   .option('--repo <path>', 'repo root')
@@ -365,13 +382,14 @@ mcp
   .command('configure')
   .requiredOption('--client <name>', `target MCP client (${MCP_CLIENTS.join('|')})`)
   .option('--repo <path>', 'repo root')
+  .option('--pin-repo', 'always pass --repo in generated MCP command args', false)
   .option('--output <path>', 'write generated config snippet to a file under repo root')
   .description('Generate MCP client configuration snippets')
   .action(
-    async (opts: { client: string; repo?: string; output?: string }) => {
+    async (opts: { client: string; repo?: string; output?: string; pinRepo?: boolean }) => {
       const repoRoot = resolveRepoRoot(opts.repo);
       const client = parseMcpClient(opts.client);
-      const snippet = buildMcpConfigSnippet(client, repoRoot);
+      const snippet = buildMcpConfigSnippet(client, repoRoot, !!opts.pinRepo);
       if (!opts.output) {
         console.log(snippet);
         return;
@@ -379,7 +397,7 @@ mcp
 
       const outputPath = resolveOutputPathUnderRepo(repoRoot, opts.output);
       fs.writeFileSync(outputPath, `${snippet}\n`, 'utf8');
-      console.log(JSON.stringify({ ok: true, client, output: outputPath }, null, 2));
+      console.log(JSON.stringify({ ok: true, client, output: outputPath, pin_repo: !!opts.pinRepo }, null, 2));
     },
   );
 
@@ -438,10 +456,11 @@ program
   .action(async (opts: { caller: string; callee: string; durationMs: string; ok?: boolean; repo?: string }) => {
     const repoRoot = resolveRepoRoot(opts.repo);
     const cfg = loadConfig(repoRoot);
+    const scope = deriveRepoScope(repoRoot);
     const ctx = createNeo4jContext(cfg.neo4j);
     try {
-      await initSchema(ctx, repoRoot);
-      const runtime = new RuntimeHookService(ctx);
+      await initSchema(ctx, scope);
+      const runtime = new RuntimeHookService(ctx, scope);
       await runtime.ingestSpan({
         callerId: opts.caller,
         calleeId: opts.callee,
@@ -449,7 +468,7 @@ program
         ok: !!opts.ok,
         timestamp: new Date().toISOString(),
       });
-      const warm = new Neo4jWarmCache(ctx);
+      const warm = new Neo4jWarmCache(ctx, scope.repoKey);
       await warm.invalidateByNodes([opts.caller, opts.callee]);
       console.log(JSON.stringify({ ok: true }, null, 2));
     } finally {

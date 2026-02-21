@@ -1,6 +1,6 @@
 {
   "name": "@autopology/mcp-server",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Model Context Protocol server implementation for AuTopology",
   "license": "Apache-2.0",
   "repository": {
@@ -30,8 +30,8 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@autopology/core": "1.0.0",
-    "@autopology/storage-neo4j": "1.0.0",
-    "@autopology/runtime-hooks": "1.0.0"
+    "@autopology/core": "1.0.1",
+    "@autopology/storage-neo4j": "1.0.1",
+    "@autopology/runtime-hooks": "1.0.1"
   }
 }

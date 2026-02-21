@@ -1,6 +1,6 @@
 {
   "name": "autopology",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "AuTopology CLI for local-first code graph indexing and MCP serving",
   "license": "Apache-2.0",
   "repository": {
@@ -33,9 +33,9 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@autopology/core": "1.0.0",
-    "@autopology/indexer": "1.0.0",
-    "@autopology/mcp-server": "1.0.0",
-    "@autopology/storage-neo4j": "1.0.0"
+    "@autopology/core": "1.0.1",
+    "@autopology/indexer": "1.0.1",
+    "@autopology/mcp-server": "1.0.1",
+    "@autopology/storage-neo4j": "1.0.1"
   }
 }

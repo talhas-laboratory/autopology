@@ -1,6 +1,6 @@
 {
   "name": "@autopology/core",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Core types, config, IDs, caching, and security helpers for AuTopology",
   "license": "Apache-2.0",
   "repository": {

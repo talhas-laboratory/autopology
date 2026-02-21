@@ -31,6 +31,15 @@ export interface AutopologyConfig {
   runtime: RuntimeConfig;
 }
 
+function neo4jEnvOverrides(): Partial<Neo4jConfig> {
+  const overrides: Partial<Neo4jConfig> = {};
+  if (process.env.NEO4J_URI) overrides.uri = process.env.NEO4J_URI;
+  if (process.env.NEO4J_USER) overrides.user = process.env.NEO4J_USER;
+  if (process.env.NEO4J_PASSWORD) overrides.password = process.env.NEO4J_PASSWORD;
+  if (process.env.NEO4J_DATABASE) overrides.database = process.env.NEO4J_DATABASE;
+  return overrides;
+}
+
 export const DEFAULT_CONFIG: AutopologyConfig = {
   neo4j: {
     uri: process.env.NEO4J_URI || 'bolt://127.0.0.1:7687',
@@ -64,7 +73,7 @@ export function loadConfig(repoRoot: string): AutopologyConfig {
   const raw = fs.readFileSync(p, 'utf8');
   const parsed = YAML.parse(raw) as Partial<AutopologyConfig>;
   return {
-    neo4j: { ...DEFAULT_CONFIG.neo4j, ...(parsed.neo4j || {}) },
+    neo4j: { ...DEFAULT_CONFIG.neo4j, ...(parsed.neo4j || {}), ...neo4jEnvOverrides() },
     index: { ...DEFAULT_CONFIG.index, ...(parsed.index || {}) },
     cache: { ...DEFAULT_CONFIG.cache, ...(parsed.cache || {}) },
     runtime: { ...DEFAULT_CONFIG.runtime, ...(parsed.runtime || {}) },

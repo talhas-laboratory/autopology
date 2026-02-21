@@ -17,11 +17,6 @@ jobs:
         ports:
           - 7474:7474
           - 7687:7687
-    env:
-      NEO4J_URI: bolt://127.0.0.1:7687
-      NEO4J_USER: neo4j
-      NEO4J_PASSWORD: autopology_dev_pw
-      NEO4J_DATABASE: neo4j
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,13 +45,18 @@ jobs:
         run: npm run typecheck
 
       - name: Unit tests
-        run: npm test
+        run: npm run test:unit
 
       - name: MCP effectiveness gate
         run: npm run test:effectiveness
 
       - name: Neo4j integration tests
-        run: npm run test:neo4j
+        env:
+          NEO4J_URI: bolt://127.0.0.1:7687
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: autopology_dev_pw
+          NEO4J_DATABASE: neo4j
+        run: npm run test:neo4j:all
 
       - name: Build
         run: npm run build
@@ -83,7 +83,7 @@ jobs:
         run: npm run typecheck
 
       - name: Unit tests
-        run: npm test
+        run: npm run test:unit
 
       - name: MCP effectiveness gate
         run: npm run test:effectiveness

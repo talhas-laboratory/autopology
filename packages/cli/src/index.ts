@@ -6,10 +6,11 @@ import { Command } from 'commander';
 import {
   deriveRepoScope,
   loadConfig,
+  type ProgressiveOutput,
   writeDefaultConfig,
 } from '@autopology/core';
 import { indexRepo, startIndexWatch } from '@autopology/indexer';
-import { runMcpServer } from '@autopology/mcp-server';
+import { runMcpServer, ToolService } from '@autopology/mcp-server';
 import {
   closeNeo4j,
   createNeo4jContext,
@@ -201,6 +202,112 @@ async function runDoctorChecks(repoRoot: string): Promise<DoctorReport> {
   } finally {
     await closeNeo4j(ctx);
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function extractRelationshipItems(output: ProgressiveOutput): Array<Record<string, unknown>> {
+  const items = output.result.relationships?.items;
+  if (!Array.isArray(items)) return [];
+  return items.filter(isRecord);
+}
+
+function summarizeProgressive(
+  output: ProgressiveOutput,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    overview: output.result.summary.overview,
+    metrics: output.result.summary.metrics,
+    key_findings: output.result.summary.key_findings,
+    confidence: output.metadata.confidence,
+    completeness: output.metadata.completeness,
+    level_provided: output.metadata.level_provided,
+    freshness: output.metadata.freshness,
+    ...extra,
+  };
+}
+
+function pickTraceNodeCandidates(findTarget: ProgressiveOutput): string[] {
+  const items = extractRelationshipItems(findTarget);
+  const isTestLocation = (location: string) => /(^|\/)(__tests__|tests?|spec)(\/|\.|_|-)/i.test(location);
+  const out: string[] = [];
+  for (const item of items) {
+    const id = item.id;
+    const location = String(item.location || '');
+    if (
+      typeof id === 'string' &&
+      id.startsWith('sym:') &&
+      !isTestLocation(location)
+    ) {
+      out.push(id);
+    }
+  }
+  return [...new Set(out)];
+}
+
+function totalCountFromSummary(output: ProgressiveOutput): number {
+  const n = output.result.summary.metrics.total_count;
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Number(n));
+}
+
+async function runMcpWorkflowSmoke(
+  repoRoot: string,
+  opts: {
+    query: string;
+    node?: string;
+    depth: number;
+    includeDetails: boolean;
+  },
+): Promise<Record<string, unknown>> {
+  const cfg = loadConfig(repoRoot);
+  return withRepo(repoRoot, async (repo) => {
+    const tools = new ToolService(repo, cfg, repoRoot);
+    await tools.warmUp();
+
+    const findTarget = await tools.findTarget(opts.query, undefined, opts.includeDetails);
+    const traceCandidates = opts.node ? [opts.node] : pickTraceNodeCandidates(findTarget);
+    if (!traceCandidates.length) traceCandidates.push('repo:root');
+
+    let traceNode = traceCandidates[0];
+    let traceImpact = await tools.traceImpact(traceNode, opts.depth, 'both', opts.includeDetails);
+    if (!opts.node && totalCountFromSummary(traceImpact) === 0) {
+      for (const candidate of traceCandidates.slice(1, 6)) {
+        const next = await tools.traceImpact(candidate, opts.depth, 'both', opts.includeDetails);
+        if (totalCountFromSummary(next) > 0) {
+          traceNode = candidate;
+          traceImpact = next;
+          break;
+        }
+      }
+      if (totalCountFromSummary(traceImpact) === 0 && traceNode !== 'repo:root') {
+        const rootTrace = await tools.traceImpact('repo:root', Math.min(2, opts.depth), 'both', opts.includeDetails);
+        if (totalCountFromSummary(rootTrace) > 0) {
+          traceNode = 'repo:root';
+          traceImpact = rootTrace;
+        }
+      }
+    }
+    const understandCodebase = await tools.understandCodebase(opts.includeDetails);
+
+    const topMatch = extractRelationshipItems(findTarget)[0];
+
+    return {
+      ok: true,
+      repo_root: repoRoot,
+      selected_trace_node: traceNode,
+      workflow: {
+        find_target: summarizeProgressive(findTarget, {
+          top_match_id: typeof topMatch?.id === 'string' ? topMatch.id : null,
+        }),
+        trace_impact: summarizeProgressive(traceImpact),
+        understand_codebase: summarizeProgressive(understandCodebase),
+      },
+    };
+  });
 }
 
 function toMermaid(node: string, impact: { upstream: Array<Record<string, unknown>>; downstream: Array<Record<string, unknown>> }): string {
@@ -398,6 +505,38 @@ mcp
       const outputPath = resolveOutputPathUnderRepo(repoRoot, opts.output);
       fs.writeFileSync(outputPath, `${snippet}\n`, 'utf8');
       console.log(JSON.stringify({ ok: true, client, output: outputPath, pin_repo: !!opts.pinRepo }, null, 2));
+    },
+  );
+
+mcp
+  .command('smoke')
+  .option('--repo <path>', 'repo root')
+  .option('--query <text>', 'find_target query used for orientation', 'mcp configure repo scope')
+  .option('--node <id>', 'explicit node id to use for trace_impact')
+  .option('--depth <n>', 'trace depth (1-3)', '2')
+  .option('--include-details', 'request level-3 details payloads', false)
+  .description('Run MCP workflow smoke checks: find_target -> trace_impact -> understand_codebase')
+  .action(
+    async (opts: {
+      repo?: string;
+      query?: string;
+      node?: string;
+      depth?: string;
+      includeDetails?: boolean;
+    }) => {
+      const repoRoot = resolveRepoRoot(opts.repo);
+      const parsedDepth = Number(opts.depth || 2);
+      if (!Number.isFinite(parsedDepth) || parsedDepth < 1 || parsedDepth > 3) {
+        throw new Error('depth must be an integer between 1 and 3');
+      }
+
+      const report = await runMcpWorkflowSmoke(repoRoot, {
+        query: String(opts.query || 'mcp configure repo scope'),
+        node: opts.node,
+        depth: Math.trunc(parsedDepth),
+        includeDetails: !!opts.includeDetails,
+      });
+      console.log(JSON.stringify(report, null, 2));
     },
   );
 

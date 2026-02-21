@@ -31,6 +31,7 @@
     "changeset:publish": "changeset publish",
     "release:pack:verify": "bash scripts/release/verify-npm-pack.sh",
     "verify:server:smoke": "bash scripts/release/verify-server-smoke.sh",
+    "verify:mcp:workflow": "node packages/cli/dist/index.js mcp smoke",
     "release:bundle:standalone": "bash scripts/release/build-standalone.sh",
     "release:docker:build": "docker build -t ghcr.io/talhas-laboratory/autology:${VERSION:-dev} ."
   },

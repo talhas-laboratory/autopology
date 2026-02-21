@@ -64,3 +64,13 @@ Pinned mode (recommended if the MCP process is not launched from repo root):
 command = "autopology"
 args = ["mcp", "--repo", "/absolute/path/to/repo"]
 ```
+
+## MCP Workflow Smoke Check
+
+Before connecting an MCP client, run a deterministic end-to-end workflow check:
+
+```bash
+autopology mcp smoke --repo /path/to/repo
+```
+
+This validates `find_target -> trace_impact -> understand_codebase` against the active repo scope and prints a structured JSON report.

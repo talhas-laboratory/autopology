@@ -28,6 +28,7 @@ interface QueryIntent {
   securityIntent: boolean;
   runtimeIntent: boolean;
   conceptIntent: boolean;
+  dataIntent: boolean;
 }
 
 const STOPWORDS = new Set([
@@ -79,6 +80,7 @@ const SECURITY_HINTS = new Set([
 ]);
 const RUNTIME_HINTS = new Set(['runtime', 'latency', 'trace', 'error', 'failure', 'crash', 'hotspot', 'slow']);
 const CONCEPT_HINTS = new Set(['concept', 'domain', 'architecture', 'design', 'model', 'pattern']);
+const DATA_HINTS = new Set(['data', 'field', 'fields', 'object', 'objects', 'schema', 'payload', 'record']);
 
 export function tokenizeSearchQuery(input: string): string[] {
   const seen = new Set<string>();
@@ -115,6 +117,7 @@ export function scoreRetrievalCandidate(query: string, candidate: RetrievalCandi
   if (queryTokens.length > 0 && lexical < 0.08 && semantic < 0.18) {
     score *= 0.35;
   }
+  score = applyEntityShapeAdjustments(score, candidate, intent);
 
   const confidence = calibratedConfidence(score, lexical, semantic, coverage);
   return {
@@ -228,10 +231,34 @@ function graphScore(candidate: RetrievalCandidateInput, queryTokens: string[], i
   if (intent.runtimeIntent && (labels.has('function') || labels.has('method'))) {
     score += 0.04;
   }
+  if (intent.dataIntent && (labels.has('dataobject') || labels.has('field'))) {
+    score += 0.08;
+  }
+  if (!intent.dataIntent && (labels.has('dataobject') || labels.has('field'))) {
+    score -= 0.12;
+  }
   if (labels.has('testcase') && !queryTokens.some((tok) => TEST_HINTS.has(tok))) {
     score = clamp01(score - 0.08);
   }
   return score;
+}
+
+function applyEntityShapeAdjustments(score: number, candidate: RetrievalCandidateInput, intent: QueryIntent): number {
+  const id = normalize(String(candidate.id || ''));
+  if (intent.dataIntent) {
+    return clamp01(id.startsWith('data:') ? score * 1.08 : score);
+  }
+  const labels = new Set(candidate.labels.map((x) => x.toLowerCase()));
+  const isDataNode = id.startsWith('data:') || labels.has('dataobject') || labels.has('field');
+  if (!isDataNode) return clamp01(score);
+
+  const name = normalize(String(candidate.name || ''));
+  const syntaxNoise = /['"{}\[\]():,]/.test(name);
+  const longSyntheticName = name.length > 80;
+  if (syntaxNoise || longSyntheticName) {
+    return clamp01(score * 0.62);
+  }
+  return clamp01(score * 0.78);
 }
 
 function tokenCoverage(queryTokens: string[], docTokens: string[]): number {
@@ -319,6 +346,7 @@ function detectIntent(queryNorm: string, tokens: string[]): QueryIntent {
     securityIntent: hasAny(tokenSet, SECURITY_HINTS),
     runtimeIntent: hasAny(tokenSet, RUNTIME_HINTS),
     conceptIntent: hasAny(tokenSet, CONCEPT_HINTS),
+    dataIntent: hasAny(tokenSet, DATA_HINTS),
   };
 }
 
@@ -334,7 +362,9 @@ function labelPrior(labels: Set<string>, intent: QueryIntent): number {
   if (intent.testIntent && labels.has('testcase')) boost += 0.18;
   if (intent.conceptIntent && labels.has('concept')) boost += 0.15;
   if (intent.fileIntent && labels.has('file')) boost += 0.08;
+  if (intent.dataIntent && (labels.has('dataobject') || labels.has('field'))) boost += 0.16;
   if (!intent.testIntent && labels.has('testcase')) boost -= 0.05;
+  if (!intent.dataIntent && (labels.has('dataobject') || labels.has('field'))) boost -= 0.12;
   return boost;
 }
 

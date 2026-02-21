@@ -94,6 +94,7 @@ npm run test
 npm run test:effectiveness
 npm run test:neo4j:scope
 npm run build
+npm run verify:mcp:workflow -- --repo /absolute/path/to/repo
 ```
 
 Server smoke verification against a target repo:

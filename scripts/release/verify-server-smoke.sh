@@ -34,7 +34,12 @@ node packages/cli/dist/index.js mcp configure --client cursor --repo "$TARGET_RE
 
 echo "[6/7] MCP config (pinned mode)"
 node packages/cli/dist/index.js mcp configure --client cursor --repo "$TARGET_REPO" --pin-repo >/tmp/autopology-mcp-pin.json
-if ! rg -- '--repo' /tmp/autopology-mcp-pin.json >/dev/null; then
+if command -v rg >/dev/null 2>&1; then
+  MATCH_CMD=(rg -- '--repo' /tmp/autopology-mcp-pin.json)
+else
+  MATCH_CMD=(grep -F -- '--repo' /tmp/autopology-mcp-pin.json)
+fi
+if ! "${MATCH_CMD[@]}" >/dev/null; then
   echo "Pinned MCP config does not include --repo."
   exit 1
 fi

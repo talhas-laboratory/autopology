@@ -94,4 +94,63 @@ describe('hybrid retrieval scoring', () => {
     expect(text).toContain('graph=');
     expect(text).toContain('coverage=');
   });
+
+  it('prioritizes exact file matches for file-path intent queries', () => {
+    const query = 'packages/core/src/security.ts';
+    const candidates = [
+      {
+        id: 'sym:typescript:packages/core/src/security.ts:Function:safeResolveUnderRepo:10',
+        labels: ['Function'],
+        name: 'safeResolveUnderRepo',
+        qualname: 'safeResolveUnderRepo',
+        path: 'packages/core/src/security.ts',
+        summary: 'safe path resolver',
+        priorityScore: 0.8,
+        degree: 20,
+      },
+      {
+        id: 'file:packages/core/src/security.ts',
+        labels: ['File'],
+        name: 'security.ts',
+        qualname: '',
+        path: 'packages/core/src/security.ts',
+        summary: 'core security utilities',
+        priorityScore: 0.6,
+        degree: 3,
+      },
+    ];
+
+    const scored = sortScoredCandidates(candidates.map((candidate) => scoreRetrievalCandidate(query, candidate)));
+    expect(scored[0].id).toBe('file:packages/core/src/security.ts');
+    expect(scored[0].evidence.lexical).toBeGreaterThan(0.7);
+  });
+
+  it('boosts test candidates when query expresses test intent', () => {
+    const query = 'tests for validate auth';
+    const candidates = [
+      {
+        id: 'sym:typescript:src/auth.ts:Function:validate:12',
+        labels: ['Function'],
+        name: 'validate',
+        qualname: 'AuthService.validate',
+        path: 'src/auth.ts',
+        summary: 'validate authentication payload',
+        priorityScore: 0.9,
+        degree: 20,
+      },
+      {
+        id: 'sym:typescript:tests/auth.test.ts:TestCase:test_validate:6',
+        labels: ['TestCase'],
+        name: 'test_validate',
+        qualname: 'auth test validate',
+        path: 'tests/auth.test.ts',
+        summary: 'covers validate auth behavior',
+        priorityScore: 0.3,
+        degree: 1,
+      },
+    ];
+
+    const scored = sortScoredCandidates(candidates.map((candidate) => scoreRetrievalCandidate(query, candidate)));
+    expect(scored[0].id).toBe('sym:typescript:tests/auth.test.ts:TestCase:test_validate:6');
+  });
 });

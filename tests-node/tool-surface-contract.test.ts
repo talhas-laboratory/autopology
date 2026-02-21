@@ -4,12 +4,14 @@ import { describe, expect, it } from 'vitest';
 
 const CORE_TOOLS = [
   'find_target',
+  'find_file_exact',
   'get_module_boundary',
   'trace_impact',
   'follow_data',
   'assess_change_risk',
   'resolve_concept',
   'get_tests_for_function',
+  'find_tests_by_path',
   'get_context_for_task',
 ];
 
@@ -31,6 +33,6 @@ describe('mcp tool surface contract', () => {
     for (const name of [...CORE_TOOLS, ...STREAM_TOOLS]) {
       expect(found.includes(name)).toBe(true);
     }
-    expect(found.length).toBe(13);
+    expect(found.length).toBe(15);
   });
 });

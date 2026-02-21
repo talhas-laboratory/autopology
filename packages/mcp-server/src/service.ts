@@ -25,6 +25,8 @@ interface FreshnessMeta {
   source: 'cache_hot' | 'cache_warm' | 'cache_cold' | 'live';
 }
 
+type RepositoryFreshness = Awaited<ReturnType<GraphRepository['getFreshness']>>;
+
 export class ToolService {
   readonly cache: CacheManager;
   readonly logger: ToolLogger;
@@ -33,6 +35,7 @@ export class ToolService {
   private totalExecutions = 0;
   private truncatedExecutions = 0;
   private confidenceTotal = 0;
+  private freshnessInFlight: Promise<RepositoryFreshness> | null = null;
 
   constructor(
     private readonly repo: GraphRepository,
@@ -50,6 +53,10 @@ export class ToolService {
     }
     const warm = new Neo4jWarmCache(repo.ctx);
     this.cache = new CacheManager(repoRoot, warm, cfg.cache);
+  }
+
+  async warmUp(): Promise<void> {
+    await Promise.allSettled([this.getFreshnessCached(true), this.repo.getMeta()]);
   }
 
   async findTarget(query: string, context?: string, includeDetails?: boolean): Promise<ProgressiveOutput> {
@@ -104,6 +111,54 @@ export class ToolService {
             expand: `tool://find_target?query=${encodeURIComponent(query)}&include_details=true`,
             narrow: `tool://find_target?query=${encodeURIComponent(query.split(' ')[0] || query)}`,
             related_queries: ['get_context_for_task', 'trace_impact'],
+          },
+          freshness,
+        });
+      });
+    });
+  }
+
+  async findFileExact(filePath: string, includeDetails?: boolean): Promise<ProgressiveOutput> {
+    return this.runTool('find_file_exact', { path: filePath, include_details: includeDetails }, async () => {
+      const cacheKey = this.key('find_file_exact', { filePath, includeDetails });
+      return this.cached(cacheKey, async (freshness) => {
+        const budget = new ContextBudgetManager();
+        const result = await this.repo.findFileExact(filePath);
+        if (!result) {
+          return notFoundOutput(`File not found: ${filePath}`, budget, freshness, 'find_target');
+        }
+
+        const summary = {
+          overview: `Resolved exact file match for "${filePath}".`,
+          metrics: {
+            total_count: 1,
+            shown_count: 1,
+            estimated_tokens: estimateTokens(result),
+          },
+          key_findings: [
+            `Path: ${String(result.path || filePath)}`,
+            `Functions: ${String(result.function_count || 0)}`,
+            `Linked tests: ${String(result.linked_test_count || 0)}`,
+          ],
+        };
+        budget.trackUsage(estimateTokens(summary));
+
+        const relationships = maybeRelationshipsObject(result, budget);
+        const details = maybeDetails(includeDetails, { implementation: JSON.stringify(result, null, 2) }, budget);
+        const truncated = (!relationships && Boolean(result)) || (Boolean(includeDetails) && !details);
+
+        return buildProgressiveOutput({
+          summary,
+          relationships,
+          details,
+          confidence: Number(result.confidence || 0.88),
+          totalAvailable: 1,
+          returned: relationships ? 1 : 0,
+          budget,
+          completeness: truncated ? 'truncated' : 'complete',
+          truncationReason: truncated ? 'context_budget' : undefined,
+          nextSteps: {
+            related_queries: ['find_tests_by_path', 'trace_impact'],
           },
           freshness,
         });
@@ -491,6 +546,64 @@ export class ToolService {
           related_queries: ['trace_impact', 'assess_change_risk'],
         },
         freshness,
+        });
+      });
+    });
+  }
+
+  async findTestsByPath(filePath: string, includeDetails?: boolean): Promise<ProgressiveOutput> {
+    return this.runTool('find_tests_by_path', { path: filePath, include_details: includeDetails }, async () => {
+      const cacheKey = this.key('find_tests_by_path', { filePath, includeDetails });
+      return this.cached(cacheKey, async (freshness) => {
+        const budget = new ContextBudgetManager();
+        const result = await this.repo.findTestsByPath(filePath);
+        const tests = (result.tests as Record<string, unknown>[]) || [];
+        const fit = fitByBudget(tests, budget, 30);
+
+        const summary = {
+          overview: `Found ${tests.length} tests linked to ${filePath}.`,
+          metrics: {
+            total_count: tests.length,
+            shown_count: fit.items.length,
+            estimated_tokens: estimateTokens(tests),
+          },
+          key_findings: [
+            result.matched_file ? `Matched file: ${String((result.matched_file as Record<string, unknown>).path || filePath)}` : 'No exact file match.',
+            tests[0] ? `Top linked test: ${String((tests[0] as Record<string, unknown>).file || 'n/a')}` : 'No linked tests found.',
+            fit.hasMore ? 'More linked tests available.' : 'Returned linked tests are complete.',
+          ],
+        };
+        budget.trackUsage(estimateTokens(summary));
+
+        const relationships = fit.items.length
+          ? {
+              items: {
+                ...result,
+                tests: fit.items,
+                suggested_tests_to_run: fit.items
+                  .map((x) => String((x as Record<string, unknown>).file || ''))
+                  .filter(Boolean),
+              },
+              has_more: fit.hasMore,
+            }
+          : undefined;
+        const details = maybeDetails(includeDetails, { implementation: JSON.stringify(result, null, 2) }, budget);
+        const truncated = fit.hasMore || (tests.length > 0 && !relationships) || (Boolean(includeDetails) && !details);
+
+        return buildProgressiveOutput({
+          summary,
+          relationships,
+          details,
+          confidence: tests.length ? 0.8 : 0.5,
+          totalAvailable: tests.length,
+          returned: fit.items.length,
+          budget,
+          completeness: truncated ? 'truncated' : tests.length ? 'complete' : 'partial',
+          truncationReason: truncated ? 'context_budget' : undefined,
+          nextSteps: {
+            related_queries: ['find_file_exact', 'trace_impact', 'assess_change_risk'],
+          },
+          freshness,
         });
       });
     });
@@ -912,7 +1025,7 @@ export class ToolService {
 
       let freshness: FreshnessMeta = { source: 'live' };
       try {
-        const f = await this.repo.getFreshness();
+        const f = await this.getFreshnessCached();
         freshness = {
           indexed_at: f.indexedAt,
           graph_version: f.graphVersion,
@@ -941,7 +1054,7 @@ export class ToolService {
     key: string,
     producer: (freshness: FreshnessMeta) => Promise<ProgressiveOutput>,
   ): Promise<ProgressiveOutput> {
-    const freshnessMeta = await this.repo.getFreshness();
+    const freshnessMeta = await this.getFreshnessCached();
     const freshnessStamp = `${freshnessMeta.graphVersion}:${freshnessMeta.indexedAt || 'none'}:${freshnessMeta.commitHash || 'none'}:${freshnessMeta.runtimeUpdatedAt || 'none'}`;
 
     const found = await this.cache.get<ProgressiveOutput>(key, freshnessStamp);
@@ -974,6 +1087,20 @@ export class ToolService {
 
   private key(tool: string, args: Record<string, unknown>): string {
     return `${tool}:${crypto.createHash('sha256').update(JSON.stringify(args)).digest('hex')}`;
+  }
+
+  private async getFreshnessCached(force = false): Promise<RepositoryFreshness> {
+    if (!force && this.freshnessInFlight) {
+      return this.freshnessInFlight;
+    }
+
+    const pending = this.repo.getFreshness();
+    this.freshnessInFlight = pending;
+    try {
+      return await pending;
+    } finally {
+      this.freshnessInFlight = null;
+    }
   }
 }
 

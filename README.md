@@ -71,6 +71,7 @@ autopology ingest-runtime \
 npm ci
 npm run typecheck
 npm run test
+npm run test:effectiveness
 npm run build
 ```
 

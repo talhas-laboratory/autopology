@@ -24,6 +24,9 @@ export async function createMcpApp(repoRoot: string) {
 
   const repo = new GraphRepository(neo4j);
   const tools = new ToolService(repo, cfg, repoRoot);
+  void tools.warmUp().catch(() => {
+    // Warm-up is best-effort and must never block server startup.
+  });
 
   const server = new McpServer({ name: 'autopology', version: '1.0.0' });
 
@@ -111,6 +114,18 @@ export async function createMcpApp(repoRoot: string) {
   );
 
   server.registerTool(
+    'find_file_exact',
+    {
+      description: 'Resolve exact file path to deterministic graph node',
+      inputSchema: {
+        path: z.string(),
+        include_details: z.boolean().optional(),
+      },
+    },
+    async ({ path, include_details }) => toolResult(await tools.findFileExact(path, include_details)),
+  );
+
+  server.registerTool(
     'get_module_boundary',
     {
       description: 'Get module interface and scope',
@@ -187,6 +202,18 @@ export async function createMcpApp(repoRoot: string) {
       },
     },
     async ({ function: fn }) => toolResult(await tools.getTestsForFunction(fn)),
+  );
+
+  server.registerTool(
+    'find_tests_by_path',
+    {
+      description: 'Find tests covering a concrete source file path',
+      inputSchema: {
+        path: z.string(),
+        include_details: z.boolean().optional(),
+      },
+    },
+    async ({ path, include_details }) => toolResult(await tools.findTestsByPath(path, include_details)),
   );
 
   server.registerTool(

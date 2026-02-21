@@ -7,7 +7,13 @@ interface StdIoServerConfig {
   args: string[];
 }
 
-function serverConfig(repoRoot: string): StdIoServerConfig {
+function serverConfig(client: McpClient, repoRoot: string): StdIoServerConfig {
+  if (client === 'vscode' || client === 'cursor' || client === 'windsurf') {
+    return {
+      command: 'autopology',
+      args: ['mcp'],
+    };
+  }
   return {
     command: 'autopology',
     args: ['mcp', '--repo', repoRoot],
@@ -24,7 +30,7 @@ export function parseMcpClient(input: string): McpClient {
 }
 
 export function buildMcpConfigObject(client: McpClient, repoRoot: string): Record<string, unknown> {
-  const stdio = serverConfig(repoRoot);
+  const stdio = serverConfig(client, repoRoot);
   if (client === 'vscode') {
     return {
       mcp: {

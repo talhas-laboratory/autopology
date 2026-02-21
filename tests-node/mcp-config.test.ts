@@ -32,7 +32,7 @@ describe('mcp config templates', () => {
         servers: {
           autopology: {
             command: 'autopology',
-            args: ['mcp', '--repo', '/repo'],
+            args: ['mcp'],
           },
         },
       },

@@ -133,6 +133,13 @@ withNeo4j('neo4j integration', () => {
       const tests = (direct.unit_tests as unknown[]) || [];
       expect(tests.length).toBeGreaterThan(0);
 
+      const exact = await graph.findFileExact('src/auth.ts');
+      expect(exact?.path).toBe('src/auth.ts');
+
+      const testsByPath = await graph.findTestsByPath('src/auth.ts');
+      const suggested = (testsByPath.suggested_tests_to_run as string[]) || [];
+      expect(suggested.some((item) => item.includes('auth.test.ts'))).toBe(true);
+
       const boundary = await graph.getModuleBoundary('src');
       expect(boundary).toBeTruthy();
       const diagnostics = (boundary?.dependency_diagnostics as Record<string, unknown>) || {};

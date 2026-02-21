@@ -31,6 +31,9 @@ export interface GraphFreshness {
 }
 
 export class GraphRepository {
+  private readonly localMemo = new Map<string, { expiresAt: number; value: unknown }>();
+  private readonly localMemoTtlMs = 1_500;
+
   constructor(readonly ctx: Neo4jContext) {}
 
   async clearGraph(): Promise<void> {
@@ -331,6 +334,12 @@ export class GraphRepository {
   }
 
   async findTarget(query: string, limit = 10): Promise<Array<Record<string, unknown>>> {
+    const memoKey = `find_target:${normalizeLookupToken(query)}:${limit}`;
+    const memoHit = this.memoGet<Array<Record<string, unknown>>>(memoKey);
+    if (memoHit) {
+      return memoHit;
+    }
+
     const session = openSession(this.ctx);
     try {
       const queryTokens = tokenizeSearchQuery(query);
@@ -389,7 +398,7 @@ export class GraphRepository {
           .filter((item) => item.score >= 0.06),
       );
 
-      return scored.slice(0, limit).map((item) => ({
+      const out = scored.slice(0, limit).map((item) => ({
         id: item.id,
         type: inferType(item.labels),
         name: item.name || item.qualname || item.id,
@@ -404,6 +413,8 @@ export class GraphRepository {
           coverage: item.evidence.coverage,
         },
       }));
+      this.memoSet(memoKey, out);
+      return out;
     } finally {
       await session.close();
     }
@@ -835,24 +846,252 @@ export class GraphRepository {
   }
 
   async getTestsForFunction(functionName: string): Promise<Record<string, unknown>> {
+    const aliases = buildFunctionAliases(functionName);
+    const memoKey = `tests_for_function:${aliases.join('|')}`;
+    const memoHit = this.memoGet<Record<string, unknown>>(memoKey);
+    if (memoHit) {
+      return memoHit;
+    }
+
+    const session = openSession(this.ctx);
+    try {
+      const targetsRes = await session.run(
+        `UNWIND $aliases AS alias
+         MATCH (f:Function)
+         WHERE toLower(coalesce(f.name,'')) = alias
+            OR toLower(coalesce(f.qualname,'')) = alias
+            OR toLower(coalesce(f.qualname,'')) ENDS WITH '.' + alias
+            OR toLower(coalesce(f.name,'')) CONTAINS alias
+            OR toLower(coalesce(f.qualname,'')) CONTAINS alias
+         RETURN DISTINCT f.id AS id,
+                coalesce(f.name, f.qualname, f.id) AS name,
+                f.path AS path
+         LIMIT 60`,
+        { aliases },
+      );
+      const targetFunctions = targetsRes.records.map((row) => ({
+        id: String(row.get('id')),
+        name: String(row.get('name')),
+        path: String(row.get('path') || ''),
+      }));
+      const targetIds = targetFunctions.map((item) => item.id);
+
+      const testsByPath = new Map<string, { file: string; coverage: number; confidence: number; reason: string }>();
+      const upsert = (candidate: { file: string; coverage?: number; confidence?: number; reason?: string }) => {
+        const file = normalizeRepoPathForLookup(candidate.file);
+        if (!file || !isLikelyTestPath(file)) return;
+        const next = {
+          file,
+          coverage: Number(candidate.coverage || 0),
+          confidence: clamp(Number(candidate.confidence || 0.5), 0.1, 0.99),
+          reason: candidate.reason || 'heuristic',
+        };
+        const current = testsByPath.get(file);
+        if (!current || next.confidence > current.confidence) {
+          testsByPath.set(file, next);
+        }
+      };
+
+      if (targetIds.length) {
+        const directRes = await session.run(
+          `UNWIND $targetIds AS targetId
+           MATCH (f:Function {id: targetId})
+           OPTIONAL MATCH (t:TestCase)-[rel:TESTS]->(f)
+           WHERE t.path IS NOT NULL
+           RETURN DISTINCT t.path AS path,
+                  coalesce(t.coverage, 0) AS coverage,
+                  coalesce(rel.confidence, 0.92) AS confidence`,
+          { targetIds },
+        );
+        for (const row of directRes.records) {
+          upsert({
+            file: String(row.get('path') || ''),
+            coverage: Number(row.get('coverage') || 0),
+            confidence: Number(row.get('confidence') || 0.92),
+            reason: 'direct_tests_edge',
+          });
+        }
+
+        const chainRes = await session.run(
+          `UNWIND $targetIds AS targetId
+           MATCH (target:Function {id: targetId})
+           MATCH p = (caller:Function)-[:CALLS*1..3]->(target)
+           WHERE caller.id <> target.id
+             AND (
+               toLower(coalesce(caller.path,'')) CONTAINS '/test'
+               OR toLower(coalesce(caller.path,'')) CONTAINS '.test.'
+               OR toLower(coalesce(caller.path,'')) CONTAINS '.spec.'
+               OR toLower(coalesce(caller.path,'')) CONTAINS '__tests__'
+               OR toLower(coalesce(caller.path,'')) CONTAINS '/spec'
+             )
+           WITH caller.path AS path, min(length(p)) AS hops
+           RETURN path, hops
+           LIMIT 120`,
+          { targetIds },
+        );
+        for (const row of chainRes.records) {
+          const hops = Math.max(1, Number(row.get('hops') || 1));
+          upsert({
+            file: String(row.get('path') || ''),
+            confidence: Math.max(0.38, 0.7 - (hops - 1) * 0.12),
+            reason: `call_chain_${hops}_hop`,
+          });
+        }
+      }
+
+      const aliasRes = await session.run(
+        `UNWIND $aliases AS alias
+         MATCH (t:TestCase)
+         WHERE any(called IN coalesce(t.called_names, [])
+           WHERE toLower(called) = alias
+              OR toLower(called) ENDS WITH '.' + alias
+              OR toLower(called) CONTAINS alias
+         )
+         RETURN DISTINCT t.path AS path, coalesce(t.coverage, 0) AS coverage
+         LIMIT 80`,
+        { aliases },
+      );
+      for (const row of aliasRes.records) {
+        upsert({
+          file: String(row.get('path') || ''),
+          coverage: Number(row.get('coverage') || 0),
+          confidence: 0.66,
+          reason: 'called_name_alias',
+        });
+      }
+
+      const ordered = [...testsByPath.values()].sort((a, b) => {
+        if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+        if (b.coverage !== a.coverage) return b.coverage - a.coverage;
+        return a.file.localeCompare(b.file);
+      });
+      const integration = ordered.filter((item) => isIntegrationTestPath(item.file));
+      const unit = ordered.filter((item) => !isIntegrationTestPath(item.file));
+
+      const out = {
+        function: functionName,
+        aliases,
+        resolved_targets: targetFunctions,
+        unit_tests: unit,
+        integration_tests: integration,
+        suggested_tests_to_run: ordered.map((t) => t.file),
+      };
+      this.memoSet(memoKey, out);
+      return out;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async findFileExact(filePath: string): Promise<Record<string, unknown> | null> {
+    const normalized = normalizeRepoPathForLookup(filePath);
+    if (!normalized) return null;
+
     const session = openSession(this.ctx);
     try {
       const res = await session.run(
-        `MATCH (t:TestCase)-[:TESTS]->(f:Function)
-         WHERE toLower(f.name) CONTAINS toLower($name)
-            OR toLower(f.qualname) CONTAINS toLower($name)
-         RETURN f.name AS fn, t.path AS path, t.coverage AS coverage
-         LIMIT 50`,
-        { name: functionName },
+        `MATCH (f:File)
+         WHERE toLower(f.path) = $pathLower
+            OR toLower(f.path) ENDS WITH '/' + $pathLower
+         WITH f,
+              CASE WHEN toLower(f.path) = $pathLower THEN 2 ELSE 1 END AS exactness
+         ORDER BY exactness DESC, size(split(coalesce(f.path,''), '/')) ASC
+         LIMIT 1
+         OPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)
+         OPTIONAL MATCH (tc:TestCase)-[:TESTS]->(fn)
+         RETURN f.id AS id,
+                f.path AS path,
+                coalesce(f.language, '') AS language,
+                count(DISTINCT fn) AS functionCount,
+                count(DISTINCT tc) AS testCount,
+                exactness`,
+        { pathLower: normalized.toLowerCase() },
       );
-      const unitTests = res.records
-        .map((r) => ({ file: r.get('path') as string, coverage: Number(r.get('coverage') || 0) }))
-        .filter((r) => r.file);
+      if (!res.records.length) return null;
+      const row = res.records[0];
+      const canonicalPath = String(row.get('path') || normalized);
       return {
-        function: functionName,
-        unit_tests: unitTests,
-        integration_tests: [],
-        suggested_tests_to_run: unitTests.map((t) => t.file),
+        id: String(row.get('id')),
+        type: 'file',
+        path: canonicalPath,
+        language: String(row.get('language') || ''),
+        function_count: Number(row.get('functionCount') || 0),
+        linked_test_count: Number(row.get('testCount') || 0),
+        confidence: Number(row.get('exactness') || 0) >= 2 ? 0.96 : 0.78,
+      };
+    } finally {
+      await session.close();
+    }
+  }
+
+  async findTestsByPath(filePath: string): Promise<Record<string, unknown>> {
+    const file = await this.findFileExact(filePath);
+    if (!file) {
+      return {
+        target_path: filePath,
+        matched_file: null,
+        tests: [],
+        suggested_tests_to_run: [],
+      };
+    }
+
+    const canonicalPath = String(file.path || filePath);
+    const session = openSession(this.ctx);
+    try {
+      const fnRes = await session.run(
+        `MATCH (f:File {path: $path})-[:CONTAINS]->(fn:Function)
+         RETURN DISTINCT coalesce(fn.name, fn.qualname, fn.id) AS fnName
+         ORDER BY fnName ASC
+         LIMIT 16`,
+        { path: canonicalPath },
+      );
+      const functionTargets = fnRes.records
+        .map((row) => String(row.get('fnName') || ''))
+        .filter(Boolean);
+
+      const merged = new Map<string, { file: string; confidence: number; reason: string }>();
+      const upsert = (candidate: { file: string; confidence?: number; reason?: string }) => {
+        const normalized = normalizeRepoPathForLookup(candidate.file);
+        if (!normalized || !isLikelyTestPath(normalized)) return;
+        const next = {
+          file: normalized,
+          confidence: clamp(Number(candidate.confidence || 0.5), 0.1, 0.99),
+          reason: candidate.reason || 'heuristic',
+        };
+        const current = merged.get(next.file);
+        if (!current || next.confidence > current.confidence) {
+          merged.set(next.file, next);
+        }
+      };
+
+      if (isLikelyTestPath(canonicalPath)) {
+        upsert({ file: canonicalPath, confidence: 0.99, reason: 'target_is_test_file' });
+      }
+
+      for (const fnName of functionTargets.slice(0, 10)) {
+        const linked = await this.getTestsForFunction(fnName);
+        const tests = ((linked.unit_tests as Array<Record<string, unknown>>) || []).concat(
+          (linked.integration_tests as Array<Record<string, unknown>>) || [],
+        );
+        for (const test of tests) {
+          upsert({
+            file: String(test.file || ''),
+            confidence: Number(test.confidence || 0.6),
+            reason: String(test.reason || 'linked_via_function'),
+          });
+        }
+      }
+
+      const ordered = [...merged.values()].sort((a, b) => {
+        if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+        return a.file.localeCompare(b.file);
+      });
+      return {
+        target_path: filePath,
+        matched_file: file,
+        function_targets: functionTargets,
+        tests: ordered,
+        suggested_tests_to_run: ordered.map((item) => item.file),
       };
     } finally {
       await session.close();
@@ -1321,18 +1560,37 @@ export class GraphRepository {
 
   private async resolveTargetNodeIds(target: string, limit = 5): Promise<string[]> {
     if (!target) return [];
+    const memoKey = `resolve_target:${normalizeLookupToken(target)}:${limit}`;
+    const memoHit = this.memoGet<string[]>(memoKey);
+    if (memoHit) {
+      return memoHit;
+    }
     if (
       target.startsWith('sym:') ||
       target.startsWith('file:') ||
       target.startsWith('module:') ||
       target.startsWith('dir:')
     ) {
-      return [target];
+      const out = [target];
+      this.memoSet(memoKey, out);
+      return out;
+    }
+
+    const normalizedPath = normalizeRepoPathForLookup(target);
+    if (normalizedPath && queryLooksLikePath(target)) {
+      const file = await this.findFileExact(normalizedPath);
+      if (file?.id) {
+        const out = [String(file.id)];
+        this.memoSet(memoKey, out);
+        return out;
+      }
     }
     const matches = await this.findTarget(target, limit);
-    return matches
+    const out = matches
       .map((item) => String(item.id || ''))
       .filter(Boolean);
+    this.memoSet(memoKey, out);
+    return out;
   }
 
   async getRuntimeSnapshot(nodeId: string): Promise<Record<string, unknown> | null> {
@@ -1465,6 +1723,23 @@ export class GraphRepository {
       }
     }
     return { lens, target, message: 'unsupported lens' };
+  }
+
+  private memoGet<T>(key: string): T | null {
+    const hit = this.localMemo.get(key);
+    if (!hit) return null;
+    if (Date.now() > hit.expiresAt) {
+      this.localMemo.delete(key);
+      return null;
+    }
+    return hit.value as T;
+  }
+
+  private memoSet<T>(key: string, value: T): void {
+    this.localMemo.set(key, {
+      value,
+      expiresAt: Date.now() + this.localMemoTtlMs,
+    });
   }
 }
 
@@ -1657,4 +1932,82 @@ function inferLikelyRootCauses(traces: Array<Record<string, unknown>>): string[]
     }
     return `${callee} is a frequent failing callee (${errors} errors).`;
   });
+}
+
+function normalizeLookupToken(input: string): string {
+  return input.toLowerCase().trim().replace(/\s+/g, ' ');
+}
+
+function normalizeRepoPathForLookup(input: string): string | null {
+  if (!input) return null;
+  let value = input.trim().replace(/\\/g, '/');
+  value = value.replace(/^\.\//, '');
+  while (value.startsWith('/')) value = value.slice(1);
+  if (!value || value.includes('\0')) return null;
+
+  const parts = value.split('/').filter((p) => p.length > 0 && p !== '.');
+  if (!parts.length) return null;
+  if (parts.some((part) => part === '..')) return null;
+  return parts.join('/');
+}
+
+function queryLooksLikePath(input: string): boolean {
+  const norm = input.trim().toLowerCase();
+  return (
+    norm.includes('/') ||
+    norm.includes('\\') ||
+    /\.[a-z0-9]{1,6}$/.test(norm)
+  );
+}
+
+function buildFunctionAliases(raw: string): string[] {
+  const out = new Set<string>();
+  const push = (value: string) => {
+    const norm = normalizeLookupToken(value).replace(/[^a-z0-9_.:$-]+/g, '');
+    if (!norm) return;
+    out.add(norm);
+  };
+
+  push(raw);
+  const symbolName = extractSymbolName(raw);
+  if (symbolName) push(symbolName);
+
+  const trimmed = raw.replace(/^sym:[^:]+:[^:]+:[^:]+:/, '');
+  if (trimmed && trimmed !== raw) push(trimmed);
+
+  const segments = raw.split(/[:.]/g).map((x) => x.trim()).filter(Boolean);
+  for (const seg of segments) {
+    push(seg);
+  }
+
+  const finalAliases = [...out]
+    .map((alias) => alias.toLowerCase())
+    .filter((alias) => alias.length >= 2)
+    .slice(0, 20);
+  return finalAliases.length ? finalAliases : [normalizeLookupToken(raw)];
+}
+
+function isLikelyTestPath(pathLike: string): boolean {
+  const path = pathLike.toLowerCase();
+  return (
+    path.includes('/test') ||
+    path.includes('/tests') ||
+    path.includes('__tests__') ||
+    path.includes('.test.') ||
+    path.includes('.spec.')
+  );
+}
+
+function isIntegrationTestPath(pathLike: string): boolean {
+  const path = pathLike.toLowerCase();
+  return (
+    path.includes('integration') ||
+    path.includes('e2e') ||
+    path.includes('.integration.')
+  );
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, value));
 }

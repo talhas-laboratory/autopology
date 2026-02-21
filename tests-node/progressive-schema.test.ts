@@ -24,13 +24,16 @@ describe('progressive output contract', () => {
       ctx: {} as never,
       getFreshness: async () => ({ graphVersion: '1', indexedAt: '2026-02-18T00:00:00Z' }),
       findTarget: async () => [{ id: 'sym:ts:a', name: 'a', location: 'src/a.ts', confidence: 0.8 }],
+      findFileExact: async () => ({ id: 'file:src/a.ts', path: 'src/a.ts', confidence: 0.9, function_count: 1, linked_test_count: 1 }),
       getModuleBoundary: async () => ({ public_api: ['a'], dependencies: ['b'], dependents: ['c'] }),
       traceImpact: async () => ({ target: 'a', upstream: [], downstream: [] }),
       followData: async () => [],
       assessChangeRisk: async () => ({ risk_level: 'low', risk_score: 10, factors: {}, safe_to_proceed: true }),
       resolveConcept: async () => ({ concept: 'auth', implementations: [], data_flow: [] }),
       getTestsForFunction: async () => ({ unit_tests: [], suggested_tests_to_run: [] }),
+      findTestsByPath: async () => ({ tests: [], suggested_tests_to_run: [] }),
       getContextForTask: async () => ({ resources: [], tools_to_call: [] }),
+      getMeta: async () => ({ schemaVersion: 1, graphVersion: '1' }),
     } as any;
 
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'autopology-schema-'));
@@ -47,12 +50,14 @@ describe('progressive output contract', () => {
 
     const outs = await Promise.all([
       svc.findTarget('a'),
+      svc.findFileExact('src/a.ts'),
       svc.getModuleBoundary('mod'),
       svc.traceImpact('sym:a'),
       svc.followData('Order'),
       svc.assessChangeRisk('x', 'y'),
       svc.resolveConcept('auth'),
       svc.getTestsForFunction('f'),
+      svc.findTestsByPath('src/a.ts'),
       svc.getContextForTask('task'),
     ]);
 

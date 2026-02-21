@@ -52,6 +52,9 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      - name: MCP effectiveness gate
+        run: npm run test:effectiveness
+
       - name: Neo4j integration tests
         run: npm run test:neo4j
 
@@ -81,6 +84,9 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+      - name: MCP effectiveness gate
+        run: npm run test:effectiveness
 
       - name: Build
         run: npm run build

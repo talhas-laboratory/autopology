@@ -18,6 +18,7 @@
     "build": "tsc -b",
     "autopology": "node packages/cli/dist/index.js",
     "test": "vitest run",
+    "test:effectiveness": "vitest run tests-node/mcp-effectiveness-gate.test.ts",
     "test:neo4j": "vitest run tests-node/integration.neo4j.test.ts",
     "test:watch": "vitest",
     "lint": "eslint . --ext .ts",
